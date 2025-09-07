@@ -12,7 +12,13 @@ class FMPError(Exception): pass
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential(min=0.2, max=2.0),
        retry=retry_if_exception_type((requests.RequestException, FMPError)))
-def _get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Any:
+# REPLACE the _num function (line 15):
+def _num(x):
+    """Convert to float safely."""
+    try: 
+        return float(x) if x is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
     if params is None: params = {}
     if not FMP_API_KEY: raise FMPError("Missing FMP_API_KEY")
     params = {**params, "apikey": FMP_API_KEY}
@@ -72,4 +78,5 @@ def peers_by_screener(sector: str, industry: str, limit: int = 20) -> List[str]:
     res = _cached("stock-screener", {"sector": sector, "industry": industry, "limit": limit}, ttl=21600)
     tickers = [r.get("symbol") for r in res if r.get("symbol")]
     return [t for t in tickers if t]
+
 
