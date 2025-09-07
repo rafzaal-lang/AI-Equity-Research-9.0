@@ -324,7 +324,7 @@ REPORT_FORM = """
         <div><div class="label">Debt Cost</div><input class="number" type="number" step="0.0001" name="kd" value="0.0500" /></div>
       </div>
       <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
-        <input type="checkbox" name="include_citations" />
+        <input type="checkbox" name="include_citations" value="1" />
         <span class="muted">Include citations (needs embeddings + filings)</span>
       </label>
       <div style="margin-top:12px;"><button class="btn" type="submit">Build report</button></div>
@@ -440,17 +440,45 @@ def home():
 @app.post("/report", response_class=HTMLResponse)
 def post_report(
     ticker: str = Form(...),
-    as_of: Optional[str] = Form(None),
-    rf: float = Form(0.045),
-    mrp: float = Form(0.055),
-    kd: float = Form(0.05),
+    as_of: str = Form(""),
+    rf: str = Form("0.045"),
+    mrp: str = Form("0.055"), 
+    kd: str = Form("0.05"),
     include_citations: Optional[str] = Form(None),
 ):
     import markdown as md
-    from src.services.financial_modeler import build_model
-    from src.services.comps.engine import comps_table, latest_metrics
-    from src.services.wacc.peer_beta import peer_beta_wacc
-    from reports.composer import compose as compose_report
+    
+    # Input validation and conversion
+    try:
+        ticker = ticker.strip().upper()
+        if not ticker:
+            return _html_error("Ticker is required", status=400)
+        
+        as_of = as_of.strip() if as_of else None
+        if as_of == "":
+            as_of = None
+            
+        # Convert string form inputs to floats
+        try:
+            rf = float(rf) if rf else 0.045
+            mrp = float(mrp) if mrp else 0.055
+            kd = float(kd) if kd else 0.05
+        except ValueError as e:
+            return _html_error(f"Invalid numeric input: {e}", status=400)
+        
+        # Checkbox handling: include_citations will be "1" if checked, None if unchecked
+        include_citations = bool(include_citations)
+        
+    except Exception as e:
+        return _html_error(f"Input validation error: {e}", status=400)
+
+    try:
+        from src.services.financial_modeler import build_model
+        from src.services.comps.engine import comps_table, latest_metrics
+        from src.services.wacc.peer_beta import peer_beta_wacc
+        from reports.composer import compose as compose_report
+    except ImportError as e:
+        return _html_error(f"Import error: {e}", status=500)
 
     # Build model with readable errors
     try:
@@ -586,7 +614,7 @@ def post_report(
             rf=rf,
             mrp=mrp,
             kd=kd,
-            include_citations=bool(include_citations),
+            include_citations=include_citations,
             kpis=kpis,
         )
     )
@@ -715,22 +743,37 @@ def screens_get():
 @app.post("/screens", response_class=HTMLResponse)
 def screens_post(
     base_ticker: str = Form(...),
-    size_min: Optional[float] = Form(None),
-    as_of: Optional[str] = Form(None),
+    size_min: Optional[str] = Form(None),
+    as_of: str = Form(""),
 ):
-    from src.services.comps.engine import comps_table
-    data = _compat_call(comps_table, base_ticker, as_of=as_of, max_peers=50)
-    rows = (data or {}).get("peers", [])
-    if size_min is not None:
-        rows = [r for r in rows if (r.get("market_cap") or 0) >= size_min]
-    return HTMLResponse(render(SCREENS_PAGE, active="screens", rows=rows))
+    try:
+        base_ticker = base_ticker.strip().upper()
+        as_of = as_of.strip() if as_of else None
+        if as_of == "":
+            as_of = None
+        
+        size_min_val = None
+        if size_min:
+            try:
+                size_min_val = float(size_min)
+            except ValueError:
+                pass
+                
+        from src.services.comps.engine import comps_table
+        data = _compat_call(comps_table, base_ticker, as_of=as_of, max_peers=50)
+        rows = (data or {}).get("peers", [])
+        if size_min_val is not None:
+            rows = [r for r in rows if (r.get("market_cap") or 0) >= size_min_val]
+        return HTMLResponse(render(SCREENS_PAGE, active="screens", rows=rows))
+    except Exception as e:
+        return HTMLResponse(render(SCREENS_PAGE, active="screens", rows=[]))
 
 @app.get("/retriever", response_class=HTMLResponse)
 def retriever_get():
     return HTMLResponse(render(RETRIEVER_PAGE, active="retriever", hits=[], has_openai=bool(OPENAI_API_KEY)))
 
 @app.post("/retriever", response_class=HTMLResponse)
-def retriever_post(query: str = Form(...), tickers: Optional[str] = Form(None)):
+def retriever_post(query: str = Form(...), tickers: str = Form("")):
     if not OPENAI_API_KEY:
         note = '<p class="muted" style="margin-top:10px;">OpenAI API key not set; cannot embed query.</p>'
         return HTMLResponse(render(RETRIEVER_PAGE + note, active="retriever", hits=[], has_openai=False), status_code=400)
@@ -742,7 +785,7 @@ def retriever_post(query: str = Form(...), tickers: Optional[str] = Form(None)):
 
         client = OpenAI(api_key=OPENAI_API_KEY)
         emb = client.embeddings.create(model=EMBED_MODEL, input=query).data[0].embedding
-        tickers_list = [t.strip().upper() for t in tickers.split(",")] if tickers else None
+        tickers_list = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else None
         raw_hits = vec_search(emb, k=12, tickers=tickers_list) or []
         rescored = []
         for h in raw_hits:
