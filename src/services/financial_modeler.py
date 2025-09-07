@@ -30,7 +30,9 @@ def ttm_snapshot(symbol: str) -> Dict[str, Any]:
     inc = (fmp.income_statement(symbol, period="annual", limit=1) or [{}])[0]
     bs = (fmp.balance_sheet(symbol, period="annual", limit=1) or [{}])[0]
     cf = (fmp.cash_flow(symbol, period="annual", limit=1) or [{}])[0]
-    km = (fmp.key_metrics_ttm(symbol) or [{}])[0]
+    km_raw = fmp.key_metrics_ttm(symbol)
+    km = km_raw[0] if isinstance(km_raw, list) and km_raw else (km_raw or {})
+
     
     revenue = _num(inc.get("revenue"))
     gross_profit = _num(inc.get("grossProfit"))
@@ -767,6 +769,7 @@ def comprehensive_financial_model(symbol: str, period: str = "annual",
     except Exception as e:
         logger.error(f"Error building comprehensive model for {symbol}: {e}")
         return {"symbol": symbol.upper(), "error": str(e)}
+
 
 
 
