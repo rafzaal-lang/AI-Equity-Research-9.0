@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 _BASE = "https://financialmodelingprep.com/api/v3"
 _API_KEY = os.getenv("FMP_API_KEY")
+if not _API_KEY:
+    log.warning("FMP_API_KEY is not set; live FMP calls will likely fail.")
 
 _DEFAULT_TIMEOUT = (5, 15)  # (connect, read)
 
@@ -46,13 +48,20 @@ def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         params.setdefault("apikey", _API_KEY)
 
     url = f"{_BASE.rstrip('/')}/{path.lstrip('/')}"
-    try:
+      try:
         resp = requests.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.warning("FMP GET failed: %s %s -> %s", url, params, e)
+        # Add response text if present
+        body = ""
+        try:
+            body = f" body={resp.text[:300]}" if 'resp' in locals() else ""
+        except Exception:
+            pass
+        log.warning("FMP GET failed: %s %s -> %s%s", url, params, e, body)
         return None
+
 
 
 def _first(lst: Any) -> Dict[str, Any]:
@@ -292,3 +301,4 @@ def ebitda_ttm(symbol: str) -> Optional[float]:
     except Exception:
         pass
     return None
+
