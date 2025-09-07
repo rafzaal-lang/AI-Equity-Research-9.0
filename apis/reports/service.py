@@ -1,46 +1,22 @@
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from src.services.ai.financial_analyst import ai_financial_analyst
-from src.services.ai.risk_analyzer import ai_risk_analyzer
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-import json
-# CORRECT:
-try:
-    import json  # Properly indented with 4 spaces
-try:
-    from src.services.report.composer import compose
-except Exception as _composer_err:
-    def compose(symbol: str, as_of: str, data=None, **kw):
-        parts = [
-            f"# {symbol} — Equity Research Note (as of {as_of})",
-            "",
-            "_(composer fallback used — original import failed)_",
-        ]
-        if data:
-            parts += ["", "```json", json.dumps(data, indent=2), "```"]
-        return "\n".join(parts)
-
-except Exception as _composer_err:
-    def compose(symbol: str, as_of: str, data=None, **kw):
-        parts = [
-            f"# {symbol} — Equity Research Note (as of {as_of})",
-            "",
-            "_(composer fallback used — original import failed)_",
-        ]
-        if data:
-            parts += ["", "```json", json.dumps(data, indent=2), "```"]
-        return "\n".join(parts)
-
+from src.services.report.composer import compose
 from src.services.financial_modeler import build_model
 from src.services.macro.snapshot import macro_snapshot
 from src.services.quant.signals import momentum, rsi, sma_cross
 from src.services.comps.engine import comps_table
 from src.services.providers import fmp_provider as fmp
-from src.services.ai.financial_analyst import ai_financial_analyst
-from src.services.ai.risk_analyzer import ai_risk_analyzer
+
+app = FastAPI(title="Reports Service")
+
+class ReportResponse(BaseModel):
+    symbol: str
+    markdown: str
 
 app = FastAPI(title="Reports Service")
 
@@ -217,6 +193,7 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
+
 
 
 
