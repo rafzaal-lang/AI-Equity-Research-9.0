@@ -4,6 +4,48 @@ import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from src.services.cache.redis_client import get_json, set_json
 
+# ---- FMP HTTP helpers ------------------------------------------------------
+from __future__ import annotations
+import os
+
+BASE_FMP = "https://financialmodelingprep.com/api/v3"
+FMP_KEY = os.getenv("FMP_API_KEY")
+
+def _require_key():
+    if not FMP_KEY:
+        raise RuntimeError("FMP_API_KEY not set")
+
+def _get(path: str, **params):
+    """
+    Synchronous HTTP GET helper for FMP.
+    Usage: _get("profile/AAPL")
+           _get("historical-price-full/AAPL", serietype="line", **{"from": "...", "to": "..."})
+    Returns parsed JSON (list/dict).
+    """
+    import requests
+    _require_key()
+    params = dict(params or {})
+    params["apikey"] = FMP_KEY
+    url = f"{BASE_FMP}/{path}"
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+async def _aget(path: str, **params):
+    """
+    Async variant if you ever need it.
+    """
+    import httpx
+    _require_key()
+    params = dict(params or {})
+    params["apikey"] = FMP_KEY
+    url = f"{BASE_FMP}/{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+# ---- end helpers -----------------------------------------------------------
+
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 FMP_BASE_URL = os.getenv("FMP_BASE_URL", "https://financialmodelingprep.com/api")
 SESSION = requests.Session()
@@ -78,5 +120,6 @@ def peers_by_screener(sector: str, industry: str, limit: int = 20) -> List[str]:
     res = _cached("stock-screener", {"sector": sector, "industry": industry, "limit": limit}, ttl=21600)
     tickers = [r.get("symbol") for r in res if r.get("symbol")]
     return [t for t in tickers if t]
+
 
 
