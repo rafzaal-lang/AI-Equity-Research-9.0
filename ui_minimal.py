@@ -2,11 +2,10 @@
 from __future__ import annotations
 import os
 import logging
-from typing import Optional, List
+from typing import Optional
 from fastapi import FastAPI, Form, Request, Query, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from jinja2 import Environment, BaseLoader, select_autoescape
-from datetime import datetime
 
 app = FastAPI(title="Equity Research — Minimal UI")
 
@@ -26,7 +25,7 @@ def _head_root():
 BASE_CURRENCY = os.getenv("BASE_CURRENCY", "USD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
-DEFAULT_TICKER = os.getenv("DEFAULT_TICKER", "AAPL").strip() or "AAPL"
+DEFAULT_TICKER = (os.getenv("DEFAULT_TICKER", "AAPL") or "AAPL").strip() or "AAPL"
 
 # Import your services
 try:
@@ -38,7 +37,7 @@ try:
     from src.services.quant.signals import momentum, rsi, sma_cross
     from src.services.providers import fmp_provider as fmp
 except ImportError as e:
-    logger.error(f"Import error: {e}")
+    logger.error("Import error: %s", e)
 
 def _compat_call(func, *args, **kwargs):
     """Drop unknown kwargs so older service signatures won't crash."""
@@ -57,29 +56,29 @@ def _build_report_markdown(ticker: str) -> str:
     try:
         model = build_model(ticker, force_refresh=False)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Model error: {str(e)}")
+        # Hard failure building the model
+        raise HTTPException(status_code=502, detail=f"Model error: {type(e).__name__}: {e}")
 
-if isinstance(model, dict) and "error" in model:
-    logging.getLogger(__name__).error("Model error for %s: %r", ticker, model["error"])
-    # Force a readable string for HTML
-    err = model["error"]
-    if not isinstance(err, str):
-        err = repr(err)
-    return _html_error(f"Model error: {err}", status=400)
-
-
+    # If model returned an error envelope, surface it nicely
     if isinstance(model, dict) and "error" in model:
-        raise HTTPException(status_code=400, detail=f"Model error: {model['error']}")
+        logging.getLogger(__name__).error("Model error for %s: %r", ticker, model["error"])
+        err = model["error"]
+        if not isinstance(err, str):
+            err = repr(err)
+        raise HTTPException(status_code=400, detail=f"Model error: {err}")
 
     try:
-        macro = macro_snapshot()
-        
-        # Get price history for quant signals
+        # Optional macro snapshot (safe fail)
+        try:
+            macro = macro_snapshot()
+        except Exception:
+            macro = {}
+
+        # Get price history for quant signals (safe fail)
         try:
             hist = fmp.historical_prices(ticker, limit=300) or []
         except Exception:
             hist = []
-
         try:
             q_mom = momentum(hist) if hist else {}
         except Exception:
@@ -103,8 +102,10 @@ if isinstance(model, dict) and "error" in model:
             "artifact_id": "ui-session",
         })
         return md
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Report generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Report generation error: {type(e).__name__}: {e}")
 
 # Simple HTML template
 BASE_HTML = """
@@ -164,14 +165,8 @@ def get_report(ticker: Optional[str] = Query(default=None), symbol: Optional[str
     sym = (ticker or symbol or "").strip() or DEFAULT_TICKER
     if not sym:
         raise HTTPException(status_code=400, detail="ticker or symbol is required")
-    
-    try:
-        md = _build_report_markdown(sym)
-        return {"symbol": sym.upper(), "markdown": md}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    md = _build_report_markdown(sym)
+    return {"symbol": sym.upper(), "markdown": md}
 
 @app.post("/report", response_class=HTMLResponse)
 def post_report(ticker: str = Form(...)):
@@ -180,7 +175,6 @@ def post_report(ticker: str = Form(...)):
         md = _build_report_markdown(ticker)
         import markdown as md_parser
         html_content = md_parser.markdown(md, extensions=["tables"])
-        
         result_html = f"""
         <div class="panel">
           <h2>{ticker.upper()} Report</h2>
@@ -193,17 +187,16 @@ def post_report(ticker: str = Form(...)):
         </div>
         """
         return HTMLResponse(render(result_html))
+    except HTTPException as he:
+        return _html_error(he.detail, status=he.status_code)
     except Exception as e:
-        return _html_error(f"Error generating report: {str(e)}")
+        return _html_error(f"Error generating report: {type(e).__name__}: {e}")
 
 @app.get("/report.md", response_class=PlainTextResponse)
 def download_report_md(ticker: str = Query(...)):
     """Download report as markdown"""
-    try:
-        md = _build_report_markdown(ticker)
-        return PlainTextResponse(md, headers={"Content-Disposition": f"attachment; filename={ticker}_report.md"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    md = _build_report_markdown(ticker)
+    return PlainTextResponse(md, headers={"Content-Disposition": f"attachment; filename={ticker}_report.md"})
 
 @app.get("/debug/env", response_class=PlainTextResponse)
 def debug_env():
@@ -220,6 +213,3 @@ def debug_env():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8090")))
-
-
-
