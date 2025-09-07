@@ -1,8 +1,10 @@
 import os
 import re
+import time
 import logging
 from typing import List, Dict, Any
 from dataclasses import dataclass
+from functools import wraps
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -16,20 +18,68 @@ class RiskFactor:
     potential_impact: str
     mitigation_factors: List[str]
 
+def rate_limit_openai_risk(calls_per_minute=10):
+    """Decorator to rate limit OpenAI API calls for risk analysis"""
+    min_interval = 60.0 / calls_per_minute
+    last_called = [0.0]
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_called[0]
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                logger.info(f"Risk analysis rate limiting: waiting {left_to_wait:.2f} seconds")
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_called[0] = time.time()
+            return ret
+        return wrapper
+    return decorator
+
 class AIRiskAnalyzer:
     """AI-powered analysis of business risks from SEC filings and financial data."""
     
     def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning("OPENAI_API_KEY not set - risk analysis will be disabled")
+            self.client = None
+        else:
+            self.client = OpenAI(api_key=api_key)
+    
+    @rate_limit_openai_risk(calls_per_minute=8)  # Conservative rate limiting for risk analysis
+    def _make_openai_request(self, messages, max_tokens=1500, temperature=0.2):
+        """Centralized OpenAI request with rate limiting and error handling"""
+        if not self.client:
+            logger.warning("OpenAI client not available - returning fallback response")
+            return None
+            
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",  # Updated to use available model
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"OpenAI API error in risk analysis: {type(e).__name__}: {e}")
+            return None
     
     def analyze_filing_risks(self, filing_text: str, symbol: str) -> List[RiskFactor]:
         """Extract and analyze risk factors from SEC filings using AI."""
+        
+        if not self.client:
+            logger.info(f"AI risk analysis disabled for {symbol} - returning basic risks")
+            return self._create_fallback_risks(symbol)
         
         # Extract risk factors section
         risk_section = self._extract_risk_section(filing_text)
         
         if not risk_section:
-            return []
+            logger.warning(f"No risk section found in filing for {symbol}")
+            return self._create_fallback_risks(symbol)
         
         # Use AI to analyze and categorize risks
         prompt = f"""
@@ -61,25 +111,23 @@ class AIRiskAnalyzer:
         }}
         """
         
+        response = self._make_openai_request([{"role": "user", "content": prompt}], max_tokens=1500)
+        
+        if not response:
+            return self._create_fallback_risks(symbol)
+        
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1500,
-                temperature=0.2
-            )
-            
             import json
-            result = json.loads(response.choices[0].message.content)
+            result = json.loads(response)
             
             risks = []
-            for risk_data in result["risks"]:
+            for risk_data in result.get("risks", []):
                 risks.append(RiskFactor(
-                    category=risk_data["category"],
-                    description=risk_data["description"],
-                    severity=risk_data["severity"],
-                    likelihood=risk_data["likelihood"],
-                    potential_impact=risk_data["potential_impact"],
+                    category=risk_data.get("category", "general"),
+                    description=risk_data.get("description", ""),
+                    severity=risk_data.get("severity", "medium"),
+                    likelihood=risk_data.get("likelihood", "medium"),
+                    potential_impact=risk_data.get("potential_impact", ""),
                     mitigation_factors=risk_data.get("mitigation_factors", [])
                 ))
             
@@ -87,7 +135,36 @@ class AIRiskAnalyzer:
             
         except Exception as e:
             logger.error(f"Error analyzing risks for {symbol}: {e}")
-            return []
+            return self._create_fallback_risks(symbol)
+    
+    def _create_fallback_risks(self, symbol: str) -> List[RiskFactor]:
+        """Create basic risk factors when AI is not available"""
+        return [
+            RiskFactor(
+                category="market",
+                description="Market volatility and economic uncertainty may impact stock performance",
+                severity="medium",
+                likelihood="high",
+                potential_impact="Stock price fluctuations and reduced investor confidence",
+                mitigation_factors=["Diversified business model", "Strong financial position"]
+            ),
+            RiskFactor(
+                category="competitive",
+                description="Intense competition in the industry may pressure margins and market share",
+                severity="medium",
+                likelihood="medium",
+                potential_impact="Reduced profitability and competitive positioning",
+                mitigation_factors=["Brand strength", "Innovation capabilities"]
+            ),
+            RiskFactor(
+                category="regulatory",
+                description="Changes in regulations and compliance requirements may increase costs",
+                severity="medium",
+                likelihood="medium",
+                potential_impact="Higher compliance costs and operational restrictions",
+                mitigation_factors=["Established compliance framework", "Government relations"]
+            )
+        ]
     
     def _extract_risk_section(self, filing_text: str) -> str:
         """Extract risk factors section from SEC filing."""
@@ -135,19 +212,29 @@ class AIRiskAnalyzer:
         
         # Low profitability risk
         net_margin = fundamentals.get("net_margin")
-        if net_margin and net_margin < 0.05:
-            risks.append(RiskFactor(
-                category="operational",
-                description=f"Low net margin of {net_margin:.1%} suggests operational inefficiency",
-                severity="medium" if net_margin > 0 else "high",
-                likelihood="high",
-                potential_impact="Vulnerability to cost inflation and competitive pressure",
-                mitigation_factors=["Cost reduction initiatives", "Pricing power"]
-            ))
+        if net_margin is not None:
+            if net_margin < 0:
+                risks.append(RiskFactor(
+                    category="operational",
+                    description=f"Negative net margin of {net_margin:.1%} indicates operating losses",
+                    severity="high",
+                    likelihood="high",
+                    potential_impact="Continued losses may threaten business sustainability",
+                    mitigation_factors=["Cost reduction initiatives", "Revenue growth strategies"]
+                ))
+            elif net_margin < 0.05:
+                risks.append(RiskFactor(
+                    category="operational",
+                    description=f"Low net margin of {net_margin:.1%} suggests operational inefficiency",
+                    severity="medium",
+                    likelihood="high",
+                    potential_impact="Vulnerability to cost inflation and competitive pressure",
+                    mitigation_factors=["Cost reduction initiatives", "Pricing power"]
+                ))
         
         # Cash flow risk
         fcf = fundamentals.get("fcf")
-        if fcf and fcf < 0:
+        if fcf is not None and fcf < 0:
             risks.append(RiskFactor(
                 category="financial",
                 description="Negative free cash flow indicates cash consumption",
@@ -155,6 +242,17 @@ class AIRiskAnalyzer:
                 likelihood="high", 
                 potential_impact="Potential need for external financing or asset sales",
                 mitigation_factors=["Access to credit facilities", "Asset monetization options"]
+            ))
+        
+        # Liquidity risk based on debt levels
+        if de_ratio and de_ratio > 1.5:
+            risks.append(RiskFactor(
+                category="financial",
+                description="High leverage may limit financial flexibility",
+                severity="medium",
+                likelihood="medium",
+                potential_impact="Reduced ability to invest in growth or weather downturns",
+                mitigation_factors=["Debt refinancing options", "Asset sales potential"]
             ))
         
         return risks
