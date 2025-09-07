@@ -92,7 +92,7 @@ def simple_dcf(symbol: str, years: int = 5) -> Dict[str, Any]:
     if not inc:
         return {"error": "No income statements"}
 
-    # Simple revenue growth from last 2 years if available
+    # Revenue growth from last 2 years if available
     if len(inc) >= 2 and inc[0].get("revenue") and inc[1].get("revenue"):
         try:
             rev_growth = float(inc[0]["revenue"]) / float(inc[1]["revenue"]) - 1.0
@@ -101,20 +101,19 @@ def simple_dcf(symbol: str, years: int = 5) -> Dict[str, Any]:
     else:
         rev_growth = 0.05
 
-    # Cap growth rates
+    # Cap growth
     rev_growth = max(min(rev_growth, 0.25), -0.10)
 
+    # Base FCF
     base_fcf = _num(inc[0].get("freeCashFlow")) or 0.0
     if base_fcf <= 0.0:
-        # Estimate FCF from operating income (rough)
-        base_fcf = (_num(inc[0].get("operatingIncome")) or 0.0) * 0.7  # rough tax adj.
+        base_fcf = (_num(inc[0].get("operatingIncome")) or 0.0) * 0.7  # rough tax adj
 
-    # Discounting assumptions with terminal guard
-    discount_rate   = 0.10
-    terminal_growth = 0.025
-    discount_rate   = max(0.01, float(discount_rate))
-    terminal_growth = min(float(terminal_growth), discount_rate - 0.005)  # ensure r > g
+    # Discounting assumptions + terminal guard
+    discount_rate   = max(0.01, 0.10)
+    terminal_growth = min(0.025, discount_rate - 0.005)  # ensure r > g
 
+    # Projections
     projections: List[Dict[str, float]] = []
     for year in range(1, years + 1):
         fcf = base_fcf * ((1.0 + rev_growth) ** year)
@@ -127,10 +126,11 @@ def simple_dcf(symbol: str, years: int = 5) -> Dict[str, Any]:
     terminal_pv   = terminal_val / ((1.0 + discount_rate) ** years)
     enterprise_value = pv_sum + terminal_pv
 
-    # Equity bridge
+    # Equity bridge and per-share
     equity_value = enterprise_value
     fair_value_per_share = None
     try:
+        # Net debt
         bs = fmp.balance_sheet(symbol, period="annual", limit=1)
         if bs:
             total_debt = _num(bs[0].get("totalDebt")) or 0.0
@@ -138,14 +138,22 @@ def simple_dcf(symbol: str, years: int = 5) -> Dict[str, Any]:
             net_debt   = total_debt - cash
             equity_value = enterprise_value - net_debt
 
-        km = fmp.key_metrics_ttm(symbol) or {}
-        # if provider ever returns a list, support it
-        if isinstance(km, list):
-            km = km[0] if km else {}
-        shares_out = _num(km.get("sharesOutstanding")) or _num(km.get("weightedAverageShsOutDil"))
+        # Shares outstanding: prefer provider helper, then TTM fields as fallback
+        shares_out = fmp.shares_outstanding(symbol)
+        if shares_out is None:
+            km = fmp.key_metrics_ttm(symbol) or {}
+            if isinstance(km, list):
+                km = km[0] if km else {}
+            shares_out = (
+                _num(km.get("sharesOutstanding"))
+                or _num(km.get("weightedAverageShsOutDil"))
+                or _num(km.get("weightedAverageShsOut"))
+            )
+
         if shares_out and shares_out > 0:
             fair_value_per_share = equity_value / shares_out
     except Exception:
+        # keep equity_value; just leave per-share None if anything fails
         pass
 
     return {
@@ -164,6 +172,7 @@ def simple_dcf(symbol: str, years: int = 5) -> Dict[str, Any]:
         "fair_value_per_share": fair_value_per_share,
         "terminal_value_pct": (terminal_pv / enterprise_value) if enterprise_value else None,
     }
+
 
 # -----------------------------------------------------------------------------
 # BUILD MODEL (basic)
@@ -711,3 +720,4 @@ def comprehensive_financial_model(symbol: str, period: str = "annual",
     except Exception as e:
         logger.error("Error building comprehensive model for %s: %s", symbol, e)
         return {"symbol": symbol.upper(), "error": str(e)}
+
