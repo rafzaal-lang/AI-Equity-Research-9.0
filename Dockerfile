@@ -1,15 +1,18 @@
 FROM python:3.11-slim
+
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Copy code into container
+
+# Copy app code
 COPY . .
-# Compile check: fail early if syntax/indent errors
+
+# Compile-time syntax check
 RUN python -m py_compile ui_minimal.py \
- && python -m py_compile src/services/providers/fmp_provider.py
+ && python -m py_compile src/services/providers/fmp_provider.py \
+ && python -m py_compile src/services/financial_modeler.py
 
-EXPOSE 8086
-CMD ["uvicorn", "apis.reports.service:app", "--host", "0.0.0.0", "--port", "8086", "--workers", "2"]
-
-
+# Start app
+CMD ["uvicorn", "ui_minimal:app", "--host", "0.0.0.0", "--port", "8080"]
