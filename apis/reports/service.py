@@ -1,5 +1,5 @@
 # apis/reports/service.py
-import sys, os
+import sys, os, re, json, logging
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 from datetime import datetime, date
@@ -28,6 +28,8 @@ try:
     from src.services.ai.risk_analyzer import ai_risk_analyzer
 except Exception:
     ai_risk_analyzer = None  # type: ignore
+
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="Reports Service")
 
@@ -58,12 +60,12 @@ class ReportRequest(BaseModel):
 def root():
     return {
         "service": "AI Equity Research - Reports Service",
-        "version": "9.1",
+        "version": "9.2",
         "status": "healthy",
         "endpoints": {
             "health": "/v1/health",
             "report_get": "/v1/report/{ticker}",
-            "report_post": "/report (POST), /v1/report (POST), /report (GET)",
+            "report_post": "/report (POST), /v1/report (POST), /report (GET), /report/{ticker} (POST)",
             "ai_analysis": "/v1/ai-analysis/{ticker}",
             "metrics": "/metrics",
             "docs": "/docs"
@@ -105,21 +107,18 @@ def debug_apis():
 @app.get("/debug/test-apis/{ticker}")
 def test_individual_apis(ticker: str):
     results: Dict[str, Any] = {}
-
     # FMP: historical prices
     try:
         hist = fmp.historical_prices(ticker, limit=5)
         results["fmp_historical"] = "SUCCESS" if hist else "NO_DATA"
     except Exception as e:
         results["fmp_historical"] = f"FAILED: {e}"
-
     # Macro (FRED)
     try:
         macro = macro_snapshot()
         results["macro_fred"] = "SUCCESS" if macro else "NO_DATA"
     except Exception as e:
         results["macro_fred"] = f"FAILED: {e}"
-
     # OpenAI (optional)
     try:
         from openai import OpenAI
@@ -136,22 +135,115 @@ def test_individual_apis(ticker: str):
             results["openai"] = "MISSING_KEY"
     except Exception as e:
         results["openai"] = f"FAILED: {e}"
-
     # Financial model
     try:
         model = build_model(ticker)
         results["financial_model"] = "SUCCESS" if model and "error" not in model else "NO_DATA"
     except Exception as e:
         results["financial_model"] = f"FAILED: {e}"
-
     # Comps
     try:
         comp = comps_table(ticker)
         results["comps"] = "SUCCESS" if comp else "NO_DATA"
     except Exception as e:
         results["comps"] = f"FAILED: {e}"
-
     return results
+
+# --------------------------------------------------------------------------------------
+# UTIL: extract & guess ticker from any kind of request
+# --------------------------------------------------------------------------------------
+_TICKER_GUESS_RE = re.compile(r"[A-Za-z]{1,6}(\.[A-Za-z]{1,3})?")
+
+async def _extract_symbol_from_request(request: Request) -> str:
+    """
+    Tries very hard to find a ticker symbol in JSON, form-data, query params, or raw text.
+    Logs request headers and a short body snippet for debugging (safe).
+    """
+    # Log content-type + small body sample
+    ctype = request.headers.get("content-type", "")
+    try:
+        raw_body = (await request.body()) or b""
+    except Exception:
+        raw_body = b""
+    body_sample = raw_body[:256].decode(errors="ignore")
+    log.info("POST /report content-type=%s body_sample=%r", ctype, body_sample)
+
+    # 1) Attempt JSON
+    sym = ""
+    try:
+        if "application/json" in ctype.lower():
+            data = json.loads(body_sample) if body_sample else await request.json()
+            if isinstance(data, dict):
+                for k in ("ticker", "symbol", "t", "s", "security", "code"):
+                    v = data.get(k)
+                    if isinstance(v, str) and v.strip():
+                        sym = v.strip()
+                        break
+                # Arrays like {"ticker":["AAPL"]} or nested payloads
+                if not sym:
+                    for k, v in data.items():
+                        if isinstance(v, list) and v and isinstance(v[0], str):
+                            m = _TICKER_GUESS_RE.match(v[0].strip())
+                            if m:
+                                sym = v[0].strip()
+                                break
+                        if isinstance(v, dict):
+                            for kk, vv in v.items():
+                                if isinstance(vv, str):
+                                    m = _TICKER_GUESS_RE.match(vv.strip())
+                                    if m:
+                                        sym = vv.strip()
+                                        break
+                            if sym:
+                                break
+            elif isinstance(data, str):
+                sym = data.strip()
+    except Exception:
+        pass
+
+    # 2) Form data
+    if not sym:
+        try:
+            form = await request.form()
+            # typical names
+            for k in ("ticker", "symbol", "t", "s"):
+                v = form.get(k)
+                if v and isinstance(v, str) and v.strip():
+                    sym = v.strip()
+                    break
+            # catch-all (e.g., ticker[])
+            if not sym:
+                for k, v in form.items():
+                    if isinstance(v, str):
+                        m = _TICKER_GUESS_RE.match(v.strip())
+                        if m:
+                            sym = v.strip()
+                            break
+        except Exception:
+            pass
+
+    # 3) Query string
+    if not sym:
+        qp = request.query_params
+        for k in ("ticker", "symbol", "t", "s", "code"):
+            v = qp.get(k)
+            if v and v.strip():
+                sym = v.strip()
+                break
+
+    # 4) Raw text fallback
+    if not sym and body_sample:
+        m = _TICKER_GUESS_RE.search(body_sample.strip())
+        if m:
+            sym = m.group(0)
+
+    # Normalize
+    sym = (sym or "").upper().strip()
+    # FINAL FALLBACK
+    if not sym:
+        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+        log.warning("No ticker found in request; falling back to %s", sym)
+    return sym
 
 # --------------------------------------------------------------------------------------
 # AI-ONLY ANALYSIS (JSON)
@@ -255,12 +347,10 @@ def get_report_v1(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET /report?ticker=AAPL (compat for some UIs)
+# GET /report?ticker=AAPL (compat for some UIs); if missing, fallback to DEFAULT_TICKER/AAPL
 @app.get("/report", response_model=ReportResponse)
 def get_report_compat(ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
-    sym = (ticker or symbol or "").strip()
-    if not sym:
-        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
+    sym = (ticker or symbol or os.getenv("DEFAULT_TICKER", "AAPL")).strip()
     try:
         md = _build_report_markdown(sym)
         return ReportResponse(symbol=sym.upper(), markdown=md)
@@ -272,9 +362,7 @@ def get_report_compat(ticker: Optional[str] = Query(default=None), symbol: Optio
 # POST /v1/report with JSON body (kept for API users)
 @app.post("/v1/report", response_model=ReportResponse)
 def post_report_v1(req: ReportRequest):
-    sym = req.get_symbol()
-    if not sym:
-        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
+    sym = (req.get_symbol() or os.getenv("DEFAULT_TICKER", "AAPL")).strip()
     try:
         md = _build_report_markdown(sym)
         return ReportResponse(symbol=sym.upper(), markdown=md)
@@ -283,7 +371,7 @@ def post_report_v1(req: ReportRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /report – accepts JSON, form-data, querystring, or raw text bodies
+# POST /report – accepts JSON, form-data, querystring, or raw text bodies; falls back to DEFAULT_TICKER/AAPL
 @app.post("/report", response_model=ReportResponse)
 async def post_report_compat(
     request: Request,
@@ -292,44 +380,33 @@ async def post_report_compat(
     ticker_q: Optional[str] = Query(default=None),
     symbol_q: Optional[str] = Query(default=None),
 ):
-    # 1) direct body fields from Body(...)
+    # Fast path: direct Body fields from Body(...)
     sym = (ticker_body or symbol_body or "").strip()
 
-    # 2) JSON body (generic)
+    # Slow path: examine the request thoroughly
     if not sym:
-        try:
-            data = await request.json()
-            if isinstance(data, dict):
-                sym = (data.get("ticker") or data.get("symbol") or data.get("t") or "").strip()
-            elif isinstance(data, str):
-                sym = data.strip()
-        except Exception:
-            pass
+        sym = await _extract_symbol_from_request(request)
 
-    # 3) form-data
-    if not sym:
-        try:
-            form = await request.form()
-            sym = (form.get("ticker") or form.get("symbol") or "").strip()
-        except Exception:
-            pass
+    # Query override if provided explicitly
+    if ticker_q or symbol_q:
+        sym = (ticker_q or symbol_q).strip()
 
-    # 4) querystring fallback
-    if not sym:
-        sym = (ticker_q or symbol_q or "").strip()
+    try:
+        md = _build_report_markdown(sym)
+        # Helpful debug header so you can see where the symbol came from (fallback or not)
+        return JSONResponse(
+            content=ReportResponse(symbol=sym.upper(), markdown=md).model_dump(),
+            headers={"X-Report-Symbol": sym.upper()}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # 5) raw text body fallback
-    if not sym:
-        try:
-            raw = (await request.body()).decode(errors="ignore").strip()
-            if raw and len(raw) < 32:
-                sym = raw
-        except Exception:
-            pass
-
-    if not sym:
-        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
-
+# Also allow POST /report/{ticker} (some UIs prefer path param on POST)
+@app.post("/report/{ticker}", response_model=ReportResponse)
+async def post_report_with_path(ticker: str):
+    sym = (ticker or os.getenv("DEFAULT_TICKER", "AAPL")).strip()
     try:
         md = _build_report_markdown(sym)
         return ReportResponse(symbol=sym.upper(), markdown=md)
