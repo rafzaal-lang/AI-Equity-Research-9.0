@@ -1,7 +1,9 @@
 import os
+import time
 import logging
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
+from functools import wraps
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -22,32 +24,150 @@ class CompanyAnalysis:
     analyst_rating: str  # "Buy", "Hold", "Sell"
     price_target_range: Dict[str, float]  # low, base, high
 
+def rate_limit_openai(calls_per_minute=15):
+    """Decorator to rate limit OpenAI API calls"""
+    min_interval = 60.0 / calls_per_minute
+    last_called = [0.0]
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            elapsed = time.time() - last_called[0]
+            left_to_wait = min_interval - elapsed
+            if left_to_wait > 0:
+                logger.info(f"Rate limiting: waiting {left_to_wait:.2f} seconds")
+                time.sleep(left_to_wait)
+            ret = func(*args, **kwargs)
+            last_called[0] = time.time()
+            return ret
+        return wrapper
+    return decorator
+
 class AIFinancialAnalyst:
     """AI-powered financial analysis that generates insights, not just calculations."""
     
     def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning("OPENAI_API_KEY not set - AI analysis will be disabled")
+            self.client = None
+        else:
+            self.client = OpenAI(api_key=api_key)
+    
+    @rate_limit_openai(calls_per_minute=12)  # Conservative rate limiting
+    def _make_openai_request(self, messages, max_tokens=1000, temperature=0.3):
+        """Centralized OpenAI request with rate limiting and error handling"""
+        if not self.client:
+            logger.warning("OpenAI client not available - returning fallback response")
+            return None
+            
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",  # Updated to use available model
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"OpenAI API error: {type(e).__name__}: {e}")
+            return None
         
     def analyze_company(self, symbol: str, financial_data: Dict[str, Any], 
                        filing_excerpts: List[str] = None) -> CompanyAnalysis:
         """Generate comprehensive AI analysis of a company."""
         
-        # Extract key financial metrics
+        if not self.client:
+            logger.info(f"AI analysis disabled for {symbol} - returning basic analysis")
+            return self._create_fallback_analysis(symbol, financial_data)
+        
+        try:
+            # Extract key financial metrics
+            fundamentals = financial_data.get("fundamentals", {})
+            dcf = financial_data.get("dcf_valuation", {})
+            comps = financial_data.get("comps", {})
+            
+            # Generate insights using AI with error handling
+            insights = self._generate_key_insights(symbol, fundamentals, dcf, comps)
+            executive_summary = self._generate_executive_summary(symbol, insights, fundamentals)
+            investment_thesis = self._generate_investment_thesis(symbol, insights, financial_data)
+            rating, price_targets = self._generate_rating_and_targets(symbol, dcf, insights)
+            
+            return CompanyAnalysis(
+                symbol=symbol,
+                executive_summary=executive_summary,
+                key_insights=insights,
+                investment_thesis=investment_thesis,
+                analyst_rating=rating,
+                price_target_range=price_targets
+            )
+        except Exception as e:
+            logger.error(f"AI analysis failed for {symbol}: {e}")
+            return self._create_fallback_analysis(symbol, financial_data)
+    
+    def _create_fallback_analysis(self, symbol: str, financial_data: Dict[str, Any]) -> CompanyAnalysis:
+        """Create a basic analysis when AI is not available"""
         fundamentals = financial_data.get("fundamentals", {})
         dcf = financial_data.get("dcf_valuation", {})
-        comps = financial_data.get("comps", {})
         
-        # Generate insights using AI
-        insights = self._generate_key_insights(symbol, fundamentals, dcf, comps)
-        executive_summary = self._generate_executive_summary(symbol, insights, fundamentals)
-        investment_thesis = self._generate_investment_thesis(symbol, insights, financial_data)
-        rating, price_targets = self._generate_rating_and_targets(symbol, dcf, insights)
+        # Create basic insights based on financial metrics
+        insights = []
+        
+        # Revenue insight
+        revenue = fundamentals.get("revenue")
+        if revenue and revenue > 1e9:
+            insights.append(FinancialInsight(
+                category="strength",
+                insight=f"Large-scale operations with revenue of ${revenue/1e9:.1f}B",
+                supporting_data={"revenue": revenue},
+                confidence=0.9
+            ))
+        
+        # Profitability insight
+        net_margin = fundamentals.get("net_margin")
+        if net_margin:
+            if net_margin > 0.15:
+                insights.append(FinancialInsight(
+                    category="strength",
+                    insight=f"Strong profitability with {net_margin:.1%} net margin",
+                    supporting_data={"net_margin": net_margin},
+                    confidence=0.8
+                ))
+            elif net_margin < 0:
+                insights.append(FinancialInsight(
+                    category="weakness",
+                    insight=f"Negative profitability with {net_margin:.1%} net margin",
+                    supporting_data={"net_margin": net_margin},
+                    confidence=0.9
+                ))
+        
+        # Determine basic rating
+        if net_margin and net_margin > 0.1:
+            rating = "Buy"
+        elif net_margin and net_margin > 0:
+            rating = "Hold"
+        else:
+            rating = "Hold"
+        
+        # Basic price targets based on DCF if available
+        dcf_value = dcf.get("fair_value_per_share") if dcf else None
+        if dcf_value:
+            price_targets = {
+                "low": dcf_value * 0.85,
+                "base": dcf_value,
+                "high": dcf_value * 1.15
+            }
+        else:
+            price_targets = {"low": 0.0, "base": 0.0, "high": 0.0}
         
         return CompanyAnalysis(
             symbol=symbol,
-            executive_summary=executive_summary,
+            executive_summary=f"Analysis completed for {symbol}. Review fundamental metrics and valuation below.",
             key_insights=insights,
-            investment_thesis=investment_thesis,
+            investment_thesis={
+                "bull_case": "Potential upside based on fundamental strength and market position.",
+                "bear_case": "Consider market risks, competitive pressures, and economic headwinds."
+            },
             analyst_rating=rating,
             price_target_range=price_targets
         )
@@ -86,35 +206,36 @@ class AIFinancialAnalyst:
         - Growth sustainability
         """
         
+        response = self._make_openai_request([{"role": "user", "content": prompt}], max_tokens=1000)
+        
+        if not response:
+            return []  # Return empty if AI fails
+        
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
-                temperature=0.3
-            )
-            
             import json
-            result = json.loads(response.choices[0].message.content)
+            result = json.loads(response)
             
             insights = []
-            for insight_data in result["insights"]:
+            for insight_data in result.get("insights", []):
                 insights.append(FinancialInsight(
-                    category=insight_data["category"],
-                    insight=insight_data["insight"],
-                    supporting_data=insight_data["supporting_data"],
+                    category=insight_data.get("category", "neutral"),
+                    insight=insight_data.get("insight", ""),
+                    supporting_data=insight_data.get("supporting_data", ""),
                     confidence=insight_data.get("confidence", 0.7)
                 ))
             
             return insights
             
         except Exception as e:
-            logger.error(f"Error generating insights for {symbol}: {e}")
+            logger.error(f"Error parsing insights for {symbol}: {e}")
             return []
     
     def _generate_executive_summary(self, symbol: str, insights: List[FinancialInsight], 
                                    fundamentals: Dict) -> str:
         """AI generates executive summary based on insights."""
+        
+        if not insights:
+            return f"{symbol} analysis completed. Review detailed financial metrics below."
         
         insight_text = "\n".join([f"- {i.insight}" for i in insights])
         
@@ -130,16 +251,11 @@ class AIFinancialAnalyst:
         Style: Professional, concise, investment-focused. Lead with the investment conclusion.
         """
         
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.3
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"Error generating executive summary for {symbol}: {e}")
+        response = self._make_openai_request([{"role": "user", "content": prompt}], max_tokens=200)
+        
+        if response:
+            return response
+        else:
             return f"{symbol} analysis completed. See detailed insights below."
     
     def _generate_investment_thesis(self, symbol: str, insights: List[FinancialInsight], 
@@ -170,31 +286,13 @@ class AIFinancialAnalyst:
         Write 2-3 sentences focusing on downside risks and challenges.
         """
         
-        try:
-            bull_response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": bull_prompt}],
-                max_tokens=150,
-                temperature=0.3
-            )
-            
-            bear_response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": bear_prompt}],
-                max_tokens=150,
-                temperature=0.3
-            )
-            
-            return {
-                "bull_case": bull_response.choices[0].message.content.strip(),
-                "bear_case": bear_response.choices[0].message.content.strip()
-            }
-        except Exception as e:
-            logger.error(f"Error generating investment thesis for {symbol}: {e}")
-            return {
-                "bull_case": "Upside potential based on financial strengths.",
-                "bear_case": "Downside risks from market challenges."
-            }
+        bull_response = self._make_openai_request([{"role": "user", "content": bull_prompt}], max_tokens=150)
+        bear_response = self._make_openai_request([{"role": "user", "content": bear_prompt}], max_tokens=150)
+        
+        return {
+            "bull_case": bull_response or "Upside potential based on financial strengths.",
+            "bear_case": bear_response or "Downside risks from market challenges."
+        }
     
     def _generate_rating_and_targets(self, symbol: str, dcf: Dict, 
                                     insights: List[FinancialInsight]) -> tuple:
