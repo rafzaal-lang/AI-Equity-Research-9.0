@@ -44,31 +44,23 @@ except ImportError as e:
     logger.error("Import error: %s", e)
 
 # ---------- Formatting helpers ----------
-_CURRENCY_SYMBOLS = {
-    "USD": "$", "CAD": "C$", "EUR": "€", "GBP": "£", "JPY": "¥",
-}
+_CURRENCY_SYMBOLS = {"USD": "$", "CAD": "C$", "EUR": "€", "GBP": "£", "JPY": "¥"}
 def _sym(cur: str) -> str:
     return _CURRENCY_SYMBOLS.get((cur or "").upper(), f"{cur or 'USD'} ")
 
 def _fmt_money(x: Any, cur: str = "USD", digits: int = 0) -> str:
-    try:
-        v = float(x)
-    except Exception:
-        return "—"
+    try: v = float(x)
+    except Exception: return "—"
     return f"{_sym(cur)}{v:,.{digits}f}"
 
 def _fmt_pct(x: Any, digits: int = 1) -> str:
-    try:
-        v = float(x) * 100.0
-    except Exception:
-        return "—"
+    try: v = float(x) * 100.0
+    except Exception: return "—"
     return f"{v:.{digits}f}%"
 
 def _fmt_num(x: Any, digits: int = 0) -> str:
-    try:
-        v = float(x)
-    except Exception:
-        return "—"
+    try: v = float(x)
+    except Exception: return "—"
     return f"{v:,.{digits}f}"
 
 def _md_table(headers: List[str], rows: List[List[str]]) -> str:
@@ -102,8 +94,8 @@ def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
         return None
     gains, losses = [], []
     for i in range(1, period + 1):
-        delta = closes[-i] - closes[-i-1]
-        (gains if delta > 0 else losses).append(abs(delta))
+        d = closes[-i] - closes[-i-1]
+        (gains if d > 0 else losses).append(abs(d))
     avg_gain = sum(gains) / period if gains else 0.0
     avg_loss = sum(losses) / period if losses else 0.0
     if avg_loss == 0:
@@ -134,11 +126,11 @@ def _llm_commentary(prompt: str) -> Optional[str]:
         return None
 
 def _bulletize(text: str) -> str:
-    """Force bullet formatting for LLM text or plain sentences."""
+    """Force bullet formatting + ensure Markdown renders as a list."""
     if not text:
         return ""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    # If it's a single paragraph, naively split sentences.
+    # If single paragraph, split into sentence-ish chunks.
     if len(lines) <= 1 and "." in text:
         parts = [p.strip() for p in text.replace("\n", " ").split(".") if p.strip()]
         lines = parts
@@ -195,9 +187,8 @@ def _build_peer_rows(tickers: List[str]) -> List[List[str]]:
         try:
             q = fmp.quote(sym) or {}
             km = fmp.key_metrics_ttm(sym) or {}
-            if isinstance(km, list):
-                km = km[0] if km else {}
-            ratios = fmp.ratios(sym, period="ttm").get("ratios") or []
+            if isinstance(km, list): km = km[0] if km else {}
+            ratios = (fmp.ratios(sym, period="ttm") or {}).get("ratios") or []
             r0 = ratios[0] if ratios else {}
             pe  = r0.get("priceEarningsRatioTTM") or r0.get("priceEarningsRatio")
             roe = km.get("roeTTM"); gm = km.get("grossProfitMarginTTM"); om = km.get("operatingProfitMarginTTM")
@@ -217,19 +208,34 @@ def _build_peer_rows(tickers: List[str]) -> List[List[str]]:
 # ---------- Composer sanitizer ----------
 def _clean_composer_markdown(md_core: str, ticker: str) -> str:
     """
-    Some composer builds start with a printed dict before the title.
-    If markdown begins with '{', drop that first line and inject a clean title.
+    Remove leading printed-dict artifact & ensure a clean title.
+    Handles cases where the dict and the title appear on the same line.
     """
     if not isinstance(md_core, str):
         return ""
     s = md_core.lstrip()
+
+    # If the very first non-space char is '{', drop the first "line" (or up to first newline).
     if s.startswith("{"):
-        first_nl = s.find("\n")
-        s = s[first_nl + 1:] if first_nl != -1 else ""
+        nl = s.find("\n")
+        if nl != -1:
+            s = s[nl+1:]
+        else:
+            # No newline — nuke the blob entirely (we'll add our own header)
+            s = ""
+
+    # Also strip if the first line still looks like a Python dict (safety net)
+    lines = s.splitlines()
+    if lines and lines[0].strip().startswith("{'symbol'"):
+        s = "\n".join(lines[1:])
+
+    # If what's left begins with an em-dash title fragment or anything not a markdown header, prepend our header.
+    if not s.lstrip().startswith("#"):
         as_of = datetime.utcnow().date().isoformat()
         header = f"# {ticker.upper()} — Equity Research Note\n_As of {as_of}_\n\n"
-        return header + s
-    return md_core
+        s = header + s.lstrip()
+
+    return s
 
 # ---------- Report builder ----------
 def _build_report_markdown(ticker: str) -> str:
@@ -242,8 +248,7 @@ def _build_report_markdown(ticker: str) -> str:
     if isinstance(model, dict) and "error" in model:
         logger.error("Model error for %s: %r", ticker, model["error"])
         err = model["error"]
-        if not isinstance(err, str):
-            err = repr(err)
+        if not isinstance(err, str): err = repr(err)
         raise HTTPException(status_code=400, detail=f"Model error: {err}")
 
     try:
@@ -252,6 +257,7 @@ def _build_report_markdown(ticker: str) -> str:
         except Exception:
             macro = {}
 
+        # Price series
         try:
             hist = fmp.historical_prices(ticker, limit=300) or []
         except Exception:
@@ -339,7 +345,7 @@ Tone: neutral, factual, non-promotional. Interpret; avoid absolute buy/sell lang
         if trend_note:
             momentum_rows.append(["Trend Note", trend_note])
 
-        # Peer comps
+        # Peer comps (best-effort)
         peer_syms = _fetch_peers(ticker)
         peer_rows = _build_peer_rows(peer_syms) if peer_syms else []
         comps_md = ""
@@ -353,9 +359,9 @@ Tone: neutral, factual, non-promotional. Interpret; avoid absolute buy/sell lang
         # Append our sections after composer
         as_of = datetime.utcnow().date().isoformat()
         extras = []
-        extras.append(f"\n---\n\n## Executive Summary (as of {as_of})\n")
+        extras.append(f"\n---\n\n## Executive Summary (as of {as_of})\n\n")  # extra blank line to ensure bullets render
         extras.append(summary + "\n")
-        extras.append("## Price & Momentum\n")
+        extras.append("## Price & Momentum\n\n")
         extras.append(_md_table(["Item", "Value"], momentum_rows) + "\n")
         if comps_md:
             extras.append(comps_md)
