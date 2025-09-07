@@ -4,12 +4,18 @@
 
 from __future__ import annotations
 import os
+import logging
 from typing import Optional, List
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from jinja2 import Environment, BaseLoader, select_autoescape
+from datetime import datetime
 
 app = FastAPI(title="Equity Research — Minimal UI")
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @app.get("/health")
 def health():
@@ -206,39 +212,6 @@ def _fmp_recent_filings(ticker: str, limit: int = 5, forms=None):
         return rows
     except Exception:
         return []
-
-# After building the model, add this:
-ai_enhanced_analysis = None
-if OPENAI_API_KEY and include_citations:  # Reuse the citations checkbox for AI
-    try:
-        from src.services.ai.financial_analyst import ai_financial_analyst
-        financial_data = {
-            "fundamentals": fundamentals or {},
-            "dcf_valuation": model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None),
-            "comps": comps
-        }
-        ai_enhanced_analysis = ai_financial_analyst.analyze_company(clean_ticker, financial_data)
-    except Exception as e:
-        logger.warning(f"AI analysis failed: {e}")
-
-# Then modify the compose_report call to include AI data:
-md_text = compose_report({
-    "symbol": ticker.upper(),
-    "as_of": as_of or "latest",
-    "call": ai_enhanced_analysis.analyst_rating if ai_enhanced_analysis else "Review",
-    "conviction": 7.0,
-    "target_low": f"${ai_enhanced_analysis.price_target_range['low']:,.0f}" if ai_enhanced_analysis else "—",
-    "target_high": f"${ai_enhanced_analysis.price_target_range['high']:,.0f}" if ai_enhanced_analysis else "—",
-    "base_currency": BASE_CURRENCY,
-    "fundamentals": fundamentals or {},
-    "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
-    "valuation": {"wacc": (w or {}).get("wacc")},
-    "comps": {"peers": (comps or {}).get("peers", [])},
-    "citations": citations,
-    "quarter": quarter or {},
-    "ai_analysis": ai_enhanced_analysis,  # NEW
-    "artifact_id": "ui-session",
-})
 
 # ---------- Optional: latest quarter snapshot (YoY deltas + short AI blurb) ----------
 def latest_quarter_snapshot(ticker: str):
@@ -557,15 +530,29 @@ def post_report(
     # Optional latest quarter snapshot
     quarter = latest_quarter_snapshot(ticker)
 
+    # AI Enhanced Analysis (properly integrated here)
+    ai_enhanced_analysis = None
+    if OPENAI_API_KEY and include_citations:  # Reuse the citations checkbox for AI
+        try:
+            from src.services.ai.financial_analyst import ai_financial_analyst
+            financial_data = {
+                "fundamentals": fundamentals or {},
+                "dcf_valuation": model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None),
+                "comps": comps
+            }
+            ai_enhanced_analysis = ai_financial_analyst.analyze_company(ticker, financial_data)
+        except Exception as e:
+            logger.warning(f"AI analysis failed: {e}")
+
     # Compose + KPIs
     try:
         md_text = compose_report({
             "symbol": ticker.upper(),
             "as_of": as_of or "latest",
-            "call": "Review",
+            "call": ai_enhanced_analysis.analyst_rating if ai_enhanced_analysis else "Review",
             "conviction": 7.0,
-            "target_low": "—",
-            "target_high": "—",
+            "target_low": f"${ai_enhanced_analysis.price_target_range['low']:,.0f}" if ai_enhanced_analysis else "—",
+            "target_high": f"${ai_enhanced_analysis.price_target_range['high']:,.0f}" if ai_enhanced_analysis else "—",
             "base_currency": BASE_CURRENCY,
             "fundamentals": fundamentals or {},
             "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
@@ -573,6 +560,7 @@ def post_report(
             "comps": {"peers": (comps or {}).get("peers", [])},
             "citations": citations,
             "quarter": quarter or {},
+            "ai_analysis": ai_enhanced_analysis,  # Include AI analysis
             "artifact_id": "ui-session",
         })
         report_html = md.markdown(md_text, extensions=["tables"])
@@ -687,13 +675,27 @@ def download_report_md(
     fundamentals = _normalize_fundamentals_from_model(model) or fundamentals_fallback_fmp(ticker)
     quarter = latest_quarter_snapshot(ticker)
 
+    # AI analysis for plain text version too
+    ai_enhanced_analysis = None
+    if cit == "1" and OPENAI_API_KEY:
+        try:
+            from src.services.ai.financial_analyst import ai_financial_analyst
+            financial_data = {
+                "fundamentals": fundamentals or {},
+                "dcf_valuation": model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None),
+                "comps": comps
+            }
+            ai_enhanced_analysis = ai_financial_analyst.analyze_company(ticker, financial_data)
+        except Exception as e:
+            logger.warning(f"AI analysis failed: {e}")
+
     md_text = compose_report({
         "symbol": ticker.upper(),
         "as_of": as_of or "latest",
-        "call": "Review",
+        "call": ai_enhanced_analysis.analyst_rating if ai_enhanced_analysis else "Review",
         "conviction": 7.0,
-        "target_low": "—",
-        "target_high": "—",
+        "target_low": f"${ai_enhanced_analysis.price_target_range['low']:,.0f}" if ai_enhanced_analysis else "—",
+        "target_high": f"${ai_enhanced_analysis.price_target_range['high']:,.0f}" if ai_enhanced_analysis else "—",
         "base_currency": BASE_CURRENCY,
         "fundamentals": fundamentals or {},
         "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
@@ -701,6 +703,7 @@ def download_report_md(
         "comps": {"peers": (comps or {}).get("peers", [])},
         "citations": citations,
         "quarter": quarter or {},
+        "ai_analysis": ai_enhanced_analysis,
         "artifact_id": "ui-session",
     })
     return PlainTextResponse(md_text)
@@ -793,4 +796,3 @@ def debug_fmp2(ticker: str = "AAPL"):
 def debug_mc(ticker: str):
     usd = _market_cap_usd_fmp(ticker)
     return PlainTextResponse(f"{ticker} market_cap_usd={usd:,.0f}" if usd else f"{ticker} failed")
-
