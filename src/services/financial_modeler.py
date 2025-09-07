@@ -147,7 +147,12 @@ def build_model(symbol: str, period: str = "annual", force_refresh: bool = False
             "dcf_valuation": dcf,
         }
     except Exception as e:
-        return {"error": str(e)}
+        import traceback, logging
+        logging.getLogger(__name__).exception("build_model failed for %s", symbol)
+        # Include the exception class name so UI shows something useful
+        msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        return {"error": msg}
+
 
 
 
@@ -749,4 +754,5 @@ def comprehensive_financial_model(symbol: str, period: str = "annual",
     except Exception as e:
         logger.error(f"Error building comprehensive model for {symbol}: {e}")
         return {"symbol": symbol.upper(), "error": str(e)}
+
 
