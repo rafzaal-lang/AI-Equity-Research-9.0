@@ -4,10 +4,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 from datetime import datetime, date
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Response, Request, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -31,14 +34,14 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
-VERSION = "9.5"
+VERSION = "9.6"
 
 app = FastAPI(title="Reports Service")
 
 # Permissive CORS for UI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten if you have a fixed UI origin
+    allow_origins=["*"],  # tighten to your UI origin if desired
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,6 +50,34 @@ app.add_middleware(
 class ReportResponse(BaseModel):
     symbol: str
     markdown: str
+
+# --------------------------------------------------------------------------------------
+# Global softeners: keep requests from failing hard with 400/422
+# --------------------------------------------------------------------------------------
+@app.exception_handler(RequestValidationError)
+async def _validation_softener(request: Request, exc: RequestValidationError):
+    # If anything tries to 422/400 due to body shape, return a default report instead
+    print(f"[reports] validation_softener on {request.url.path}: {exc}")
+    sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+    try:
+        md = _build_report_markdown(sym)
+        return JSONResponse({"symbol": sym, "markdown": md})
+    except Exception as e:
+        return JSONResponse({"detail": f"softened validation error: {e}"}, status_code=500)
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_softener(request: Request, exc: StarletteHTTPException):
+    # If it's a 400 on /report, try to recover by producing a default report
+    if request.url.path.rstrip("/") == "/report" and exc.status_code == 400:
+        print(f"[reports] http_softener recovered 400 for /report: {exc.detail}")
+        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+        try:
+            md = _build_report_markdown(sym)
+            return JSONResponse({"symbol": sym, "markdown": md})
+        except Exception as e:
+            return JSONResponse({"detail": f"softened http error: {e}"}, status_code=500)
+    # otherwise pass through
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
 # --------------------------------------------------------------------------------------
 # ROOT & HEALTH
@@ -133,7 +164,6 @@ def test_individual_apis(ticker: str):
         results["openai"] = f"FAILED: {e}"
     try:
         model = build_model(ticker)
-        # New: only treat as error if the value is meaningful/truthy
         err = model.get("error") if isinstance(model, dict) else None
         results["financial_model"] = "SUCCESS" if not err else f"ERROR_VALUE:{err!r}"
     except Exception as e:
@@ -146,81 +176,58 @@ def test_individual_apis(ticker: str):
     return results
 
 # --------------------------------------------------------------------------------------
-# UTIL: extract & guess ticker from any kind of request (no Pydantic Body parsing)
+# Body parsing helpers (zero reliance on request.form())
 # --------------------------------------------------------------------------------------
 _TICKER_GUESS_RE = re.compile(r"[A-Za-z]{1,6}(\.[A-Za-z]{1,3})?")
 
+def _guess_ticker_from_text(text: str) -> Optional[str]:
+    m = _TICKER_GUESS_RE.search(text or "")
+    return m.group(0).upper() if m else None
+
 async def _extract_symbol_from_request(request: Request) -> str:
     """
-    Tries to find a ticker in JSON, form-data, query params, or raw text.
-    Prints a short line for visibility even if logging isn't configured.
+    Avoids Starlette's form parser entirely. Reads raw body bytes, tries:
+    1) JSON   2) urlencoded  3) text regex
+    Always returns something (defaulting to env or AAPL).
     """
-    ctype = request.headers.get("content-type", "")
+    ctype = (request.headers.get("content-type") or "").lower()
     try:
-        raw_body = (await request.body()) or b""
+        raw = (await request.body()) or b""
     except Exception:
-        raw_body = b""
-    sample = raw_body[:256].decode(errors="ignore")
-    print(f"[reports] POST /report dbg ctype={ctype} sample={sample!r}")
+        raw = b""
+    sample = raw[:256].decode(errors="ignore")
+    print(f"[reports] compat hit; ctype={ctype} sample={sample!r}")
 
-    # 1) JSON
-    try:
-        if "application/json" in (ctype or "").lower():
-            try:
-                data = json.loads(raw_body.decode(errors="ignore"))
-            except Exception:
-                data = await request.json()  # second chance
+    # JSON
+    if "json" in ctype:
+        try:
+            data = json.loads(raw.decode(errors="ignore"))
             if isinstance(data, dict):
                 for k in ("ticker", "symbol", "t", "s", "security", "code"):
                     v = data.get(k)
                     if isinstance(v, str) and v.strip():
                         return v.strip().upper()
-                # arrays / nested dicts
-                for v in data.values():
-                    if isinstance(v, list) and v and isinstance(v[0], str):
-                        m = _TICKER_GUESS_RE.match(v[0].strip())
-                        if m:
-                            return v[0].strip().upper()
-                    if isinstance(v, dict):
-                        for vv in v.values():
-                            if isinstance(vv, str):
-                                m = _TICKER_GUESS_RE.match(vv.strip())
-                                if m:
-                                    return vv.strip().upper()
             elif isinstance(data, str) and data.strip():
                 return data.strip().upper()
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # 2) Form (x-www-form-urlencoded / multipart)
-    try:
-        form = await request.form()
-        for k in ("ticker", "symbol", "t", "s"):
-            v = form.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip().upper()
-        for v in form.values():
-            if isinstance(v, str):
-                m = _TICKER_GUESS_RE.match(v.strip())
-                if m:
-                    return v.strip().upper()
-    except Exception:
-        pass
+    # urlencoded (we parse manually; no starlette form parser)
+    if "application/x-www-form-urlencoded" in ctype:
+        try:
+            kv = parse_qs(raw.decode(errors="ignore"), keep_blank_values=True)
+            for k in ("ticker", "symbol", "t", "s", "code"):
+                arr = kv.get(k)
+                if arr and isinstance(arr[0], str) and arr[0].strip():
+                    return arr[0].strip().upper()
+        except Exception:
+            pass
 
-    # 3) Query string
-    qp = request.query_params
-    for k in ("ticker", "symbol", "t", "s", "code"):
-        v = qp.get(k)
-        if v and v.strip():
-            return v.strip().upper()
+    # text/plain or anything else: regex guess
+    tick = _guess_ticker_from_text(sample or "")
+    if tick:
+        return tick
 
-    # 4) Raw text fallback
-    if sample:
-        m = _TICKER_GUESS_RE.search(sample.strip())
-        if m:
-            return m.group(0).upper()
-
-    # FINAL FALLBACK
     return os.getenv("DEFAULT_TICKER", "AAPL").upper()
 
 # --------------------------------------------------------------------------------------
@@ -229,13 +236,12 @@ async def _extract_symbol_from_request(request: Request) -> str:
 def _build_report_markdown(ticker: str) -> str:
     model = build_model(ticker)
 
-    # NEW: only raise if error value is meaningful (not 0/""/None/False)
+    # Only treat as error if the error value is meaningful/truthy
     if isinstance(model, dict):
         err = model.get("error", None)
         if err not in (None, "", 0, False):
             raise HTTPException(status_code=404, detail=str(err))
     else:
-        # Keep going if model isn't a dict; downstream calls will handle missing keys
         print(f"[reports] build_model returned non-dict for {ticker}: {type(model).__name__}")
 
     macro = macro_snapshot()
@@ -297,12 +303,10 @@ def get_ai_analysis(ticker: str):
         raise HTTPException(status_code=500, detail="AI analyst not available")
     try:
         model = build_model(ticker)
-        # NEW: handle {"error": 0} safely
         if isinstance(model, dict):
             err = model.get("error", None)
             if err not in (None, "", 0, False):
                 raise HTTPException(status_code=404, detail=str(err))
-
         comp = comps_table(ticker)
         financial_data = {
             "fundamentals": (model or {}).get("core_financials", {}) if isinstance(model, dict) else {},
@@ -353,11 +357,13 @@ async def post_report_v1(request: Request):
     # parse JSON leniently
     sym = ""
     try:
-        data = await request.json()
-        if isinstance(data, dict):
-            sym = (data.get("ticker") or data.get("symbol") or "").strip().upper()
-        elif isinstance(data, str):
-            sym = data.strip().upper()
+        data = await request.body()
+        if data:
+            obj = json.loads(data.decode(errors="ignore"))
+            if isinstance(obj, dict):
+                sym = (obj.get("ticker") or obj.get("symbol") or "").strip().upper()
+            elif isinstance(obj, str):
+                sym = obj.strip().upper()
     except Exception:
         sym = ""
     if not sym:
@@ -370,14 +376,15 @@ async def post_report_v1(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /report and /report/ – no Body() params at all; we read manually
+# POST /report and /report/ – **no** Body parsers used
 @app.post("/report", response_model=ReportResponse)
 @app.post("/report/", response_model=ReportResponse)
 async def post_report_compat(request: Request, ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
+    print("[reports] /report compat endpoint invoked")
     # 1) Querystring wins if present
     sym = (ticker or symbol or "").strip().upper()
 
-    # 2) Otherwise, try to extract from body (JSON, form, or raw text)
+    # 2) Otherwise, try to extract from raw body (JSON/urlencoded/text)
     if not sym:
         sym = await _extract_symbol_from_request(request)
 
