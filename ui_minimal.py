@@ -59,7 +59,7 @@ def _build_report_markdown(ticker: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Model error: {str(e)}")
 
-        if isinstance(model, dict) and "error" in model:
+    if isinstance(model, dict) and "error" in model:
         logging.getLogger(__name__).error("Model error for %s: %r", ticker, model["error"])
         # Force a readable string for HTML
         err = model["error"]
@@ -219,4 +219,5 @@ def debug_env():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8090")))
+
 
