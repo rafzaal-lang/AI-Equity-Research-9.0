@@ -9,8 +9,6 @@ from src.services.providers import fmp_provider as fmp
 
 log = logging.getLogger(__name__)
 
-# ---- small utils -----------------------------------------------------------
-
 def _first(lst: Any) -> Dict[str, Any]:
     if isinstance(lst, list) and lst:
         x = lst[0]
@@ -35,13 +33,7 @@ def _div(a: Optional[float], b: Optional[float]) -> Optional[float]:
 def _is_pos_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(x) and x > 0
 
-# ---- robust peer stats -----------------------------------------------------
-
 def robust_peer_pe(peers: List[Dict[str, Any]], min_n: int = 3) -> Optional[float]:
-    """
-    Compute a trimmed mean of positive, sane P/E values to avoid outliers.
-    Keep 25th–75th percentile and average.
-    """
     vals = [
         float(p.get("pe"))
         for p in peers or []
@@ -54,33 +46,23 @@ def robust_peer_pe(peers: List[Dict[str, Any]], min_n: int = 3) -> Optional[floa
     mid = vals[k1:k2] or vals
     return sum(mid) / len(mid)
 
-# ---- fundamentals aggregator -----------------------------------------------
-
 def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
-    """
-    Pulls TTM-ish fundamentals from FMP with resilient key mapping.
-    Returns a dict with the keys your pipeline expects.
-    """
     sym = symbol.upper()
 
-    metrics_ttm = fmp.key_metrics_ttm(sym) or []
-    km = _first(metrics_ttm)
+    km_list = fmp.key_metrics_ttm(sym) or []
+    km = _first(km_list)
 
-    # Try quote/profile for market cap as a fallback
     mc = fmp.market_cap(sym)
     ev_row = fmp.enterprise_values(sym) or {}
-    ev = ev_row.get("enterpriseValue") if isinstance(ev_row, dict) else None
+    ev = ev_row.get("enterpriseValue")
     if not isinstance(ev, (int, float)):
-        # some endpoints return list; grab first row if needed
         ev = _first(fmp.enterprise_values(sym)).get("enterpriseValue")
 
-    # Try to obtain revenue/income/FCF from key metrics TTM; fallback to statements if needed
     revenue = _get(km, ["revenueTTM", "revenue_ttm", "revenue"])
     net_income = _get(km, ["netIncomeTTM", "net_income_ttm", "netIncome"])
     fcf = _get(km, ["freeCashFlowTTM", "fcfTTM", "freeCashFlow"])
 
     if revenue is None or net_income is None or fcf is None:
-        # fallback to latest annual statements as a last resort
         inc = _first(fmp.income_statement(sym, period="annual", limit=1))
         cfs = _first(fmp.cash_flow_statement(sym, period="annual", limit=1))
         if revenue is None:
@@ -88,12 +70,10 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
         if net_income is None:
             net_income = _get(inc, ["netIncome", "netIncomeApplicableToCommonShares", "netincome"])
         if fcf is None:
-            # FCF ~ operatingCashFlow - capitalExpenditure
             ocf = _get(cfs, ["netCashProvidedByOperatingActivities", "operatingCashFlow", "cashFlowFromOperations"])
             capex = _get(cfs, ["capitalExpenditure", "capex"])
             fcf = ocf - capex if (ocf is not None and capex is not None) else None
 
-    # margins/returns from key metrics if available
     gross_margin = _get(km, ["grossProfitMarginTTM", "grossMarginTTM", "grossMargin"])
     op_margin    = _get(km, ["operatingMarginTTM", "opMarginTTM", "operatingMargin"])
     net_margin   = _get(km, ["netProfitMarginTTM", "netMarginTTM", "netMargin"])
@@ -114,8 +94,5 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Any]:
         "enterprise_value": ev,
         "pe": pe,
     }
-
-    # FCF yield if we can compute it
     fundamentals["fcf_yield"] = _div(fcf, mc)
-
     return fundamentals
