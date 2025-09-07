@@ -85,6 +85,42 @@ def test_individual_apis(ticker: str):
     except Exception as e:
         results["macro_fred"] = f"FAILED: {str(e)}"
     
+   # NEW: AI Analysis endpoint
+@app.get("/v1/ai-analysis/{ticker}")
+def get_ai_analysis(ticker: str):
+    """Get pure AI analysis without full report."""
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=400, detail="OpenAI API key required")
+    
+    try:
+        # Get financial data
+        model = build_model(ticker)
+        if "error" in model:
+            raise HTTPException(status_code=404, detail=model["error"])
+        
+        comp = comps_table(ticker)
+        
+        # Prepare data for AI
+        financial_data = {
+            "fundamentals": model.get("core_financials", {}),
+            "dcf_valuation": model.get("dcf_valuation", {}),
+            "comps": comp
+        }
+        
+        # Generate AI analysis
+        ai_analysis = ai_financial_analyst.analyze_company(ticker, financial_data)
+        ai_risks = ai_risk_analyzer.analyze_financial_risks(financial_data)
+        
+        return {
+            "symbol": ticker.upper(),
+            "analysis": ai_analysis,
+            "risks": ai_risks,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
     # Test OpenAI API
     try:
         import openai
@@ -154,5 +190,6 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
+
 
 
