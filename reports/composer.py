@@ -1,5 +1,6 @@
 # src/services/report/composer.py
 from typing import Any, Dict, Optional, List
+from datetime import date
 
 def _fmt_pct(x: Any, already_pct: bool = False) -> str:
     try:
@@ -11,7 +12,12 @@ def _fmt_pct(x: Any, already_pct: bool = False) -> str:
     except Exception:
         return "–"
 
-def compose(symbol: str, as_of: str, data: Optional[Dict[str, Any]] = None, **kwargs) -> str:
+def compose(
+    symbol: str,
+    as_of: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+    **kwargs
+) -> str:
     """
     Build a simple markdown research note. You can pass fields either via the
     `data` dict or as keyword args.
@@ -23,6 +29,9 @@ def compose(symbol: str, as_of: str, data: Optional[Dict[str, Any]] = None, **kw
       - transcripts: str or markdown (e.g., analyst Q&A bullets)
       - risks: List[str]
     """
+    if not as_of:
+        as_of = date.today().isoformat()
+
     ctx: Dict[str, Any] = {}
     if data:
         ctx.update(data)
