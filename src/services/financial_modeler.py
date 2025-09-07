@@ -91,6 +91,9 @@ def simple_dcf(symbol: str, years: int = 5) -> Dict[str, Any]:
     # Simple DCF projection
     discount_rate = 0.10
     terminal_growth = 0.025
+    # terminal growth guard
+    discount_rate = max(0.01, float(discount_rate))
+    terminal_growth = min(float(terminal_growth), discount_rate - 0.005)  # ensure w > g
     
     projections = []
     for year in range(1, years + 1):
@@ -764,6 +767,7 @@ def comprehensive_financial_model(symbol: str, period: str = "annual",
     except Exception as e:
         logger.error(f"Error building comprehensive model for {symbol}: {e}")
         return {"symbol": symbol.upper(), "error": str(e)}
+
 
 
 
