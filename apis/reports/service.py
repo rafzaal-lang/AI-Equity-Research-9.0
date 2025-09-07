@@ -7,9 +7,9 @@ from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import json
+# CORRECT:
 try:
-   # replace: from src.services.report.composer import compose
-import json
+    import json  # Properly indented with 4 spaces
 try:
     from src.services.report.composer import compose
 except Exception as _composer_err:
@@ -217,6 +217,7 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
+
 
 
 
