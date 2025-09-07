@@ -1,258 +1,279 @@
 # src/services/report/composer.py
-from typing import Any, Dict, Optional, List
+from __future__ import annotations
 
-def _fmt_pct(x: Any, already_pct: bool = False) -> str:
-    try:
-        if x is None:
-            return "–"
-        v = float(x) if already_pct else (float(x) * 100.0)
-        sign = "+" if v > 0 else ""
-        return f"{sign}{v:.1f}%"
-    except Exception:
-        return "–"
+from typing import Any, Dict, Optional, List
+from datetime import date
+from dataclasses import asdict, is_dataclass
+
+# ---------- formatting helpers ----------
 
 def _fmt_money(x: Any, currency: str = "USD") -> str:
     try:
         if x is None:
-            return "–"
+            return "—"
         v = float(x)
-        if abs(v) >= 1e9:
-            return f"{currency} {v/1e9:.1f}B"
-        elif abs(v) >= 1e6:
-            return f"{currency} {v/1e6:.1f}M"
-        elif abs(v) >= 1e3:
-            return f"{currency} {v/1e3:.1f}K"
-        else:
-            return f"{currency} {v:,.0f}"
+        abs_v = abs(v)
+        if abs_v >= 1_000_000_000_000:
+            return f"${v/1_000_000_000_000:.2f}T"
+        if abs_v >= 1_000_000_000:
+            return f"${v/1_000_000_000:.2f}B"
+        if abs_v >= 1_000_000:
+            return f"${v/1_000_000:.2f}M"
+        return f"${v:,.0f}"
     except Exception:
-        return "–"
+        # also allow strings like "$1.2B" to pass through
+        return str(x) if isinstance(x, str) and x else "—"
 
-def compose(symbol: str, as_of: str, data: Optional[Dict[str, Any]] = None, **kwargs) -> str:
-    """
-    Build a comprehensive markdown research note from inputs.
+def _fmt_pct(x: Any, already_pct: bool = False) -> str:
+    try:
+        if x is None:
+            return "—"
+        v = float(x) if already_pct else (float(x) * 100.0)
+        sign = "+" if v > 0 else ""
+        return f"{sign}{v:.1f}%"
+    except Exception:
+        return "—"
 
-    Expected keys in `data` or kwargs:
-      - call: str (Buy/Hold/Sell)
-      - conviction: float (1-10 scale)
-      - target_low: str
-      - target_high: str
-      - base_currency: str
-      - highlights: List[str]
-      - momentum: {m5d, m3m, m6m, breadth50, breadth200}
-      - fundamentals: {revenue, net_income, fcf, margins, ratios}
-      - dcf: DCF valuation results
-      - valuation: {wacc, etc}
-      - comps: {peers: [...]}
-      - quarter: {period, revenue_yoy, eps_yoy, notes}
-      - citations: List[{title, source_type, date, url}]
-      - ai_analysis: AI-generated analysis object
-      - risks: List[str]
+def _fmt_ratio(x: Any, decimals: int = 2) -> str:
+    try:
+        if x is None:
+            return "—"
+        v = float(x)
+        return f"{v:.{decimals}f}"
+    except Exception:
+        return "—"
+
+def _fmt_plain(x: Any) -> str:
+    return str(x).strip() if x is not None else ""
+
+def _take_n(items: List[Dict[str, Any]], n: int = 8) -> List[Dict[str, Any]]:
+    return items[:n] if isinstance(items, list) else []
+
+def _to_dict(obj: Any) -> Dict[str, Any]:
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, dict):
+        return obj
+    # unknown type: do not render repr; return empty
+    return {}
+
+# ---------- main composer ----------
+
+def compose(
+    symbol: str,
+    as_of: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+    **kwargs
+) -> str:
     """
+    Build a clean markdown research note from your payload without dumping raw dicts.
+
+    Accepts:
+      - data: dict payload, may include:
+          base_currency, fundamentals, dcf, comps, citations, ai_analysis (dataclass), valuation, momentum, highlights, transcripts, risks
+      - kwargs: merged into context
+    """
+    if not as_of:
+        as_of = date.today().isoformat()
+
     ctx: Dict[str, Any] = {}
-    if data:   ctx.update(data)
-    if kwargs: ctx.update(kwargs)
+    if data:
+        ctx.update(data)
+    if kwargs:
+        ctx.update(kwargs)
 
-    call = ctx.get("call", "Review")
-    conviction = ctx.get("conviction", 7.0)
-    target_low = ctx.get("target_low", "—")
-    target_high = ctx.get("target_high", "—")
-    base_currency = ctx.get("base_currency", "USD")
-    
-    md: List[str] = [
-        f"# {symbol} — Equity Research Report",
-        f"**Date:** {as_of} | **Rating:** {call} | **Conviction:** {conviction}/10",
-        f"**Price Targets:** {target_low} - {target_high}",
-        ""
-    ]
+    currency = ctx.get("base_currency", "USD")
 
-    # Executive Summary from AI if available
-    ai_analysis = ctx.get("ai_analysis")
-    if ai_analysis and hasattr(ai_analysis, 'executive_summary'):
-        md.append("## Executive Summary")
-        md.append(ai_analysis.executive_summary)
-        md.append("")
-        
-        # Investment Thesis
-        if hasattr(ai_analysis, 'investment_thesis'):
-            thesis = ai_analysis.investment_thesis
-            md.append("### Investment Thesis")
-            if isinstance(thesis, dict):
-                if thesis.get("bull_case"):
-                    md.append(f"**Bull Case:** {thesis['bull_case']}")
-                if thesis.get("bear_case"):
-                    md.append(f"**Bear Case:** {thesis['bear_case']}")
-            md.append("")
-
-    # Latest Quarter Performance
-    quarter = ctx.get("quarter") or {}
-    if quarter and quarter.get("period"):
-        md.append("## Latest Quarter Highlights")
-        md.append(f"**Period:** {quarter['period']}")
-        
-        if quarter.get("revenue_yoy") is not None:
-            md.append(f"- Revenue YoY: {_fmt_pct(quarter['revenue_yoy'])}")
-        if quarter.get("eps_yoy") is not None:
-            md.append(f"- EPS YoY: {_fmt_pct(quarter['eps_yoy'])}")
-        if quarter.get("op_income_yoy") is not None:
-            md.append(f"- Operating Income YoY: {_fmt_pct(quarter['op_income_yoy'])}")
-            
-        if quarter.get("notes"):
-            md.append(f"\n*{quarter['notes']}*")
-        md.append("")
-
-    # Financial Overview
+    # ---- Topline KPIs (if present) ----
     fundamentals = ctx.get("fundamentals") or {}
-    if fundamentals:
-        md.append("## Financial Overview")
-        
-        # Core metrics
-        if fundamentals.get("revenue"):
-            md.append(f"- **Revenue:** {_fmt_money(fundamentals['revenue'], base_currency)}")
-        if fundamentals.get("net_income"):
-            md.append(f"- **Net Income:** {_fmt_money(fundamentals['net_income'], base_currency)}")
-        if fundamentals.get("fcf"):
-            md.append(f"- **Free Cash Flow:** {_fmt_money(fundamentals['fcf'], base_currency)}")
-            
-        # Margins
-        margins = []
-        if fundamentals.get("gross_margin"):
-            margins.append(f"Gross: {_fmt_pct(fundamentals['gross_margin'])}")
-        if fundamentals.get("op_margin"):
-            margins.append(f"Operating: {_fmt_pct(fundamentals['op_margin'])}")
-        if margins:
-            md.append(f"- **Margins:** {' | '.join(margins)}")
-            
-        # Returns
-        returns = []
-        if fundamentals.get("roic"):
-            returns.append(f"ROIC: {_fmt_pct(fundamentals['roic'])}")
-        if fundamentals.get("de_ratio"):
-            returns.append(f"D/E: {fundamentals['de_ratio']:.1f}x")
-        if returns:
-            md.append(f"- **Key Ratios:** {' | '.join(returns)}")
+    kpi_market_cap = ctx.get("market_cap") or fundamentals.get("market_cap") or _nested(ctx, ["comps", "peers", 0, "market_cap"])
+    kpi_ev = ctx.get("enterprise_value") or fundamentals.get("enterprise_value") or _nested(ctx, ["comps", "peers", 0, "enterprise_value"])
+    kpi_pe = fundamentals.get("pe") or _nested(ctx, ["comps", "peers", 0, "pe"])
+    kpi_fcf_yield = fundamentals.get("fcf_yield")  # expect a decimal e.g. 0.04
+
+    # ---- DCF (if present) ----
+    dcf = ctx.get("dcf") or ctx.get("dcf_valuation") or {}
+    dcf_ev = dcf.get("enterprise_value")
+    dcf_eq = dcf.get("equity_value")
+    dcf_tv = dcf.get("terminal_value")
+    dcf_tv_pct = dcf.get("terminal_value_pct")
+    dcf_assump = dcf.get("assumptions") or {}
+    dcf_rg = dcf_assump.get("revenue_growth")
+    dcf_dr = dcf_assump.get("discount_rate")
+    dcf_tg = dcf_assump.get("terminal_growth")
+    dcf_years = dcf_assump.get("projection_years")
+
+    # ---- AI analysis (dataclass CompanyAnalysis) ----
+    ai_analysis = _to_dict(ctx.get("ai_analysis"))
+    ai_exec = ai_analysis.get("executive_summary")
+    ai_rating = ai_analysis.get("analyst_rating")
+    ai_targets = ai_analysis.get("price_target_range") or {}
+    ai_thesis = ai_analysis.get("investment_thesis") or {}
+    ai_insights = ai_analysis.get("key_insights") or []
+
+    # ---- Comps (compact table) ----
+    peers = (ctx.get("comps") or {}).get("peers") or []
+    peers_rows = []
+    for row in _take_n(peers, 8):
+        if not isinstance(row, dict):
+            continue
+        peers_rows.append({
+            "Ticker": row.get("ticker"),
+            "P/E": _fmt_ratio(row.get("pe")),
+            "EV/EBITDA": _fmt_ratio(row.get("ev_ebitda")),
+            "P/S": _fmt_ratio(row.get("ps")),
+            "Mkt Cap": _fmt_money(row.get("market_cap"), currency),
+        })
+
+    # ---- Citations ----
+    citations = ctx.get("citations") or []
+
+    md: List[str] = [f"# {symbol} — Equity Research Note *(as of {as_of})*", ""]
+
+    # Snapshot
+    if any([kpi_market_cap, kpi_ev, kpi_pe, kpi_fcf_yield]):
+        md.append("## Snapshot")
+        md.append(f"- **Market Cap:** {_fmt_money(kpi_market_cap, currency)}")
+        md.append(f"- **Enterprise Value:** {_fmt_money(kpi_ev, currency)}")
+        md.append(f"- **P/E:** {_fmt_ratio(kpi_pe)}")
+        md.append(f"- **FCF Yield:** {_fmt_pct(kpi_fcf_yield)}")
         md.append("")
 
-    # Valuation Analysis
-    dcf = ctx.get("dcf") or {}
-    valuation = ctx.get("valuation") or {}
-    if dcf or valuation:
-        md.append("## Valuation Analysis")
-        
-        if dcf.get("enterprise_value"):
-            md.append(f"- **Enterprise Value:** {_fmt_money(dcf['enterprise_value'], base_currency)}")
-        if dcf.get("fair_value_per_share"):
-            md.append(f"- **DCF Fair Value:** {base_currency} {dcf['fair_value_per_share']:.2f} per share")
-            
-        # DCF assumptions
-        assumptions = dcf.get("assumptions") or {}
-        if assumptions:
-            wacc = assumptions.get("wacc") or valuation.get("wacc")
-            if wacc:
-                md.append(f"- **WACC:** {_fmt_pct(wacc)}")
-            if assumptions.get("g1"):
-                md.append(f"- **Growth Assumptions:** Stage 1: {_fmt_pct(assumptions['g1'])}, Terminal: {_fmt_pct(assumptions.get('g_terminal', 0.025))}")
+    # Analyst Rating & Targets
+    if ai_rating or ai_targets:
+        md.append("## Analyst View")
+        if ai_rating:
+            md.append(f"- **Rating:** {ai_rating}")
+        if isinstance(ai_targets, dict) and ai_targets:
+            low = _fmt_money(ai_targets.get("low"), currency)
+            base = _fmt_money(ai_targets.get("base"), currency)
+            high = _fmt_money(ai_targets.get("high"), currency)
+            md.append(f"- **Target Range (EV):** Low {low} · Base {base} · High {high}")
         md.append("")
 
-    # Peer Comparison
-    comps = ctx.get("comps") or {}
-    peers = comps.get("peers", [])
-    if peers and len(peers) > 1:
-        md.append("## Peer Comparison")
-        md.append("| Company | P/E | P/S | EV/EBITDA | Market Cap |")
-        md.append("|---------|-----|-----|-----------|------------|")
-        
-        for peer in peers[:6]:  # Show top 6 peers
-            ticker_name = peer.get("ticker", "—")
-            pe = f"{peer['pe']:.1f}" if peer.get("pe") else "—"
-            ps = f"{peer['ps']:.1f}" if peer.get("ps") else "—"
-            ev_ebitda = f"{peer['ev_ebitda']:.1f}" if peer.get("ev_ebitda") else "—"
-            mc = _fmt_money(peer.get("market_cap"), base_currency)
-            md.append(f"| {ticker_name} | {pe} | {ps} | {ev_ebitda} | {mc} |")
+    # Executive Summary
+    if ai_exec:
+        md.append("## Executive Summary")
+        md.append(ai_exec.strip())
         md.append("")
 
-    # AI Key Insights
-    if ai_analysis and hasattr(ai_analysis, 'key_insights'):
-        insights = ai_analysis.key_insights
-        if insights:
-            md.append("## Key Investment Insights")
-            
-            # Group insights by category
-            insights_by_category = {}
-            for insight in insights:
-                category = insight.category.title()
-                if category not in insights_by_category:
-                    insights_by_category[category] = []
-                insights_by_category[category].append(insight)
-            
-            for category, category_insights in insights_by_category.items():
-                md.append(f"### {category}s")
-                for insight in category_insights:
-                    confidence_emoji = "🟢" if insight.confidence > 0.8 else "🟡" if insight.confidence > 0.6 else "🟠"
-                    md.append(f"- {confidence_emoji} {insight.insight}")
-                md.append("")
+    # Key Insights
+    if isinstance(ai_insights, list) and ai_insights:
+        md.append("## Key Insights")
+        by_cat: Dict[str, List[str]] = {"strength": [], "opportunity": [], "weakness": [], "threat": []}
+        for it in ai_insights:
+            it_d = _to_dict(it)
+            cat = str(it_d.get("category", "other")).lower()
+            insight = _fmt_plain(it_d.get("insight"))
+            if not insight:
+                continue
+            by_cat.setdefault(cat, []).append(insight)
+        for cat in ["strength", "opportunity", "weakness", "threat"]:
+            items = by_cat.get(cat) or []
+            if items:
+                md.append(f"**{cat.title()}s**")
+                md.extend(f"- {s}" for s in items)
+        md.append("")
 
-    # Momentum & Technical
+    # DCF Summary
+    if any([dcf_ev, dcf_eq, dcf_tv, dcf_tv_pct, dcf_assump]):
+        md.append("## DCF Summary")
+        if any([dcf_ev, dcf_eq]):
+            md.append(f"- **Enterprise Value:** {_fmt_money(dcf_ev, currency)}  ·  **Equity Value:** {_fmt_money(dcf_eq, currency)}")
+        if dcf_tv is not None or dcf_tv_pct is not None:
+            md.append(f"- **Terminal Value:** {_fmt_money(dcf_tv, currency)}  ({_fmt_pct(dcf_tv_pct, already_pct=True)} of EV)")
+        if any([dcf_rg, dcf_dr, dcf_tg, dcf_years]):
+            md.append(f"- **Assumptions:** Rev growth {_fmt_pct(dcf_rg)} · Discount {_fmt_pct(dcf_dr)} · Terminal {_fmt_pct(dcf_tg)} · Years {_fmt_ratio(dcf_years, 0)}")
+        md.append("")
+
+    # Highlights (your existing field)
+    highlights = ctx.get("highlights") or []
+    if isinstance(highlights, list) and highlights:
+        md.append("## Highlights")
+        md.extend(f"- {b}" for b in highlights)
+        md.append("")
+
+    # Momentum (your existing field)
     momentum = ctx.get("momentum") or {}
-    if momentum:
-        md.append("## Technical & Momentum")
-        
-        timeframes = []
-        if momentum.get("m5d") is not None:
-            timeframes.append(f"5D: {_fmt_pct(momentum['m5d'])}")
-        if momentum.get("m3m") is not None:
-            timeframes.append(f"3M: {_fmt_pct(momentum['m3m'])}")
-        if momentum.get("m6m") is not None:
-            timeframes.append(f"6M: {_fmt_pct(momentum['m6m'])}")
-        
-        if timeframes:
-            md.append(f"- **Returns:** {' | '.join(timeframes)}")
-            
-        breadth = []
-        if momentum.get("breadth50") is not None:
-            breadth.append(f"{_fmt_pct(momentum['breadth50'], True)} above 50DMA")
-        if momentum.get("breadth200") is not None:
-            breadth.append(f"{_fmt_pct(momentum['breadth200'], True)} above 200DMA")
-        
-        if breadth:
-            md.append(f"- **Breadth:** {' | '.join(breadth)}")
+    if isinstance(momentum, dict) and momentum:
+        m5d  = _fmt_pct(momentum.get("m5d"))
+        m3m  = _fmt_pct(momentum.get("m3m"))
+        m6m  = _fmt_pct(momentum.get("m6m"))
+        b50  = _fmt_pct(momentum.get("breadth50"), already_pct=True)
+        b200 = _fmt_pct(momentum.get("breadth200"), already_pct=True)
+        md.append("## Momentum Snapshot")
+        md.append(f"- **5D:** {m5d} · **3M:** {m3m} · **6M:** {m6m}")
+        md.append(f"- **Breadth:** {b50} above 50DMA · {b200} above 200DMA")
         md.append("")
 
-    # Risk Factors
-    risks = ctx.get("risks", [])
-    # Also check AI analysis for risks
-    if ai_analysis and hasattr(ai_analysis, 'key_insights'):
-        ai_risks = [insight.insight for insight in ai_analysis.key_insights 
-                   if insight.category in ['weakness', 'threat']]
-        risks.extend(ai_risks)
-    
-    if risks:
-        md.append("## Risk Factors")
-        for risk in risks[:5]:  # Limit to top 5 risks
-            md.append(f"- {risk}")
+    # Valuation note (freeform)
+    valuation_note = ctx.get("valuation")
+    if valuation_note:
+        md.append("## Valuation Notes")
+        md.append(str(valuation_note).strip())
         md.append("")
 
-    # Citations/Sources
-    citations = ctx.get("citations", [])
-    if citations:
-        md.append("## Sources & Citations")
-        for i, citation in enumerate(citations[:5], 1):
-            title = citation.get("title", "Document")
-            source_type = citation.get("source_type", "")
-            date = citation.get("date", "")
-            url = citation.get("url", "")
-            
+    # Peers table (compact)
+    if peers_rows:
+        md.append("## Peer Snapshot")
+        md.append("| Ticker | P/E | EV/EBITDA | P/S | Mkt Cap |")
+        md.append("|:------:|----:|----------:|----:|-------:|")
+        for r in peers_rows:
+            md.append(f"| {r['Ticker']} | {r['P/E']} | {r['EV/EBITDA']} | {r['P/S']} | {r['Mkt Cap']} |")
+        md.append("")
+
+    # Transcript notes (freeform)
+    transcripts = ctx.get("transcripts")
+    if transcripts:
+        md.append("## Transcript Q&A Notes")
+        md.append(str(transcripts).strip())
+        md.append("")
+
+    # Risks (list)
+    risks = ctx.get("risks") or []
+    if isinstance(risks, list) and risks:
+        md.append("## Risks")
+        md.extend(f"- {r}" for r in risks)
+        md.append("")
+
+    # Citations
+    if isinstance(citations, list) and citations:
+        md.append("## Citations")
+        for c in citations:
+            if not isinstance(c, dict):
+                continue
+            title = c.get("title") or "Source"
+            url = c.get("url")
+            date_str = c.get("date")
+            src_type = c.get("source_type")
+            line = f"- **{title}**"
+            if src_type:
+                line += f" — {src_type}"
+            if date_str:
+                line += f" ({date_str})"
             if url:
-                md.append(f"{i}. [{title}]({url}) - {source_type} ({date})")
-            else:
-                md.append(f"{i}. {title} - {source_type} ({date})")
+                line += f" — [{url}]({url})"
+            md.append(line)
         md.append("")
-
-    # Disclaimer
-    md.append("---")
-    md.append("**Disclaimer:** This report is for informational purposes only and does not constitute investment advice. Past performance does not guarantee future results. Please consult with a qualified financial advisor before making investment decisions.")
-    
-    # Metadata
-    artifact_id = ctx.get("artifact_id", "report")
-    md.append(f"\n*Generated by AI Equity Research Platform | ID: {artifact_id}*")
 
     return "\n".join(md).strip()
+
+# ---------- tiny helper to safely walk nested dicts ----------
+
+def _nested(d: Dict[str, Any], path: List[Any], default: Any = None) -> Any:
+    cur: Any = d
+    for key in path:
+        try:
+            if isinstance(key, int):
+                if isinstance(cur, list) and 0 <= key < len(cur):
+                    cur = cur[key]
+                else:
+                    return default
+            else:
+                if isinstance(cur, dict):
+                    cur = cur.get(key, default)
+                else:
+                    return default
+        except Exception:
+            return default
+    return cur
