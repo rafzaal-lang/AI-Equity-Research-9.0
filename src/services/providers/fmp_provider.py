@@ -1,95 +1,294 @@
 # src/services/providers/fmp_provider.py
+"""
+Financial Modeling Prep (FMP) provider – thin, defensive wrappers around the FMP API.
+
+This module centralizes all HTTP calls to FMP and normalizes the return shapes so
+the rest of the app can rely on consistent structures.
+
+Environment:
+  FMP_API_KEY   – required for live calls
+
+Notes on return shapes (to match existing callers in the repo):
+  - enterprise_values() returns {"enterpriseValues": [ ... ]}  # wrapped list
+  - ratios()            returns {"ratios": [ ... ]}            # wrapped list
+  - key_metrics_ttm()   returns a single dict (the first/only TTM record)
+  - historical_prices() returns a list of {date, close} dicts
+  - latest_price()      returns a float or None
+  - income_statement(), balance_sheet(), cash_flow() return lists (newest first)
+"""
+
 from __future__ import annotations
 
 import os
 import logging
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
-import httpx
+import requests
 
 log = logging.getLogger(__name__)
 
-FMP_API_KEY = os.getenv("FMP_API_KEY") or os.getenv("FMP_KEY") or os.getenv("FINANCIAL_MODELING_PREP_KEY")
-BASE_URL = "https://financialmodelingprep.com/api/v3"
+_BASE = "https://financialmodelingprep.com/api/v3"
+_API_KEY = os.getenv("FMP_API_KEY")
+
+_DEFAULT_TIMEOUT = (5, 15)  # (connect, read)
 
 
-def _apikey() -> str:
-    if not FMP_API_KEY:
-        log.warning("FMP_API_KEY not set; requests will likely fail.")
-    return FMP_API_KEY or ""
+class FMPError(Exception):
+    pass
 
 
-def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Union[Dict[str, Any], List[Any], None]:
-    """Small HTTP helper with sane defaults."""
-    p = {"apikey": _apikey()}
-    if params:
-        p.update(params)
-    url = f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """GET helper with API key injection and safe fallbacks."""
+    if params is None:
+        params = {}
+    if _API_KEY:
+        # FMP accepts both 'apikey' and 'apikey=' – use 'apikey'
+        params.setdefault("apikey", _API_KEY)
+
+    url = f"{_BASE.rstrip('/')}/{path.lstrip('/')}"
     try:
-        with httpx.Client(timeout=20.0) as client:
-            r = client.get(url, params=p)
-            r.raise_for_status()
-            return r.json()
+        resp = requests.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        log.error("FMP GET failed: %s %s :: %s", url, p, e)
+        log.warning("FMP GET failed: %s %s -> %s", url, params, e)
         return None
 
 
-def _first_row(obj: Any) -> Dict[str, Any]:
-    return obj[0] if isinstance(obj, list) and obj else (obj if isinstance(obj, dict) else {})
+def _first(lst: Any) -> Dict[str, Any]:
+    return lst[0] if isinstance(lst, list) and lst else {}
 
 
-# -------- Core endpoints we rely on -------------------------------------------------------------
-
-@lru_cache(maxsize=256)
-def key_metrics_ttm(symbol: str) -> List[Dict[str, Any]]:
-    """https://financialmodelingprep.com/developer/docs#key-metrics-ttm"""
-    data = _get(f"key-metrics-ttm/{symbol.upper()}")
-    return data if isinstance(data, list) else []
-
-@lru_cache(maxsize=256)
-def income_statement(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
-    """https://financialmodelingprep.com/developer/docs#income-statement"""
-    data = _get(f"income-statement/{symbol.upper()}", {"period": period, "limit": limit})
-    return data if isinstance(data, list) else []
-
-@lru_cache(maxsize=256)
-def cash_flow_statement(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
-    """https://financialmodelingprep.com/developer/docs#cash-flow-statement"""
-    data = _get(f"cash-flow-statement/{symbol.upper()}", {"period": period, "limit": limit})
-    return data if isinstance(data, list) else []
-
-@lru_cache(maxsize=256)
-def market_cap(symbol: str) -> Optional[float]:
-    """https://financialmodelingprep.com/developer/docs#market-capitalization"""
-    data = _get(f"market-capitalization/{symbol.upper()}", {"limit": 1})
-    row = _first_row(data)
-    mc = row.get("marketCap")
-    return float(mc) if isinstance(mc, (int, float)) else None
-
-@lru_cache(maxsize=256)
-def enterprise_values(symbol: str, period: str = "quarter", limit: int = 1) -> Dict[str, Any]:
-    """https://financialmodelingprep.com/developer/docs#enterprise-values"""
-    data = _get(f"enterprise-values/{symbol.upper()}", {"period": period, "limit": limit})
-    return _first_row(data)
-
-# -------- Useful extras used elsewhere in your project ------------------------------------------
-
-@lru_cache(maxsize=256)
-def latest_price(symbol: str) -> Optional[float]:
-    """https://financialmodelingprep.com/developer/docs#quote"""
-    data = _get(f"quote/{symbol.upper()}", {"limit": 1})
-    row = _first_row(data)
-    px = row.get("price")
-    return float(px) if isinstance(px, (int, float)) else None
-
-@lru_cache(maxsize=256)
-def quote(symbol: str) -> Dict[str, Any]:
-    data = _get(f"quote/{symbol.upper()}", {"limit": 1})
-    return _first_row(data)
-
-@lru_cache(maxsize=256)
+# -----------------------------------------------------------------------------
+# Basic company info
+# -----------------------------------------------------------------------------
 def profile(symbol: str) -> Dict[str, Any]:
-    data = _get(f"profile/{symbol.upper()}")
-    return _first_row(data)
+    data = _get_json(f"profile/{symbol}") or []
+    return _first(data)
+
+
+def quote(symbol: str) -> Dict[str, Any]:
+    data = _get_json(f"quote/{symbol}") or []
+    return _first(data)
+
+
+def latest_price(symbol: str) -> Optional[float]:
+    # Try the short quote first (fast & small)
+    data = _get_json(f"quote-short/{symbol}") or []
+    price = _first(data).get("price")
+    if price is not None:
+        return float(price)
+    # Fallback to full quote
+    q = quote(symbol)
+    if q and q.get("price") is not None:
+        return float(q["price"])
+    return None
+
+
+def market_cap(symbol: str) -> Optional[float]:
+    q = quote(symbol)
+    mc = q.get("marketCap")
+    if mc is not None:
+        return float(mc)
+    p = profile(symbol)
+    mc = p.get("mktCap")
+    return float(mc) if mc is not None else None
+
+
+def shares_outstanding(symbol: str) -> Optional[float]:
+    # Prefer profile field; naming varies in FMP payloads.
+    p = profile(symbol)
+    for key in ("sharesOutstanding", "shareOutstanding", "outstandingShares"):
+        if p.get(key) is not None:
+            try:
+                return float(p[key])
+            except Exception:
+                pass
+    # Fallback: shares float endpoint (if enabled on your plan)
+    data = _get_json(f"shares_float/{symbol}") or {}
+    # Some accounts get a list back
+    if isinstance(data, list):
+        data = _first(data)
+    for key in ("outstandingShares", "outstanding"):
+        if data.get(key) is not None:
+            try:
+                return float(data[key])
+            except Exception:
+                pass
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Historical prices (for quant signals)
+# -----------------------------------------------------------------------------
+def historical_prices(symbol: str, limit: int = 300) -> List[Dict[str, Any]]:
+    """
+    Returns list of {date, close}. Tries 'historical-price-full' first, then chart.
+    """
+    # Preferred – compact line series
+    data = _get_json(
+        f"historical-price-full/{symbol}",
+        {"serietype": "line", "timeseries": int(limit)},
+    ) or {}
+    hist = data.get("historical")
+    if isinstance(hist, list) and hist:
+        # normalize keys -> {date, close}
+        out = []
+        for r in hist:
+            if r is None:
+                continue
+            out.append(
+                {
+                    "date": r.get("date") or r.get("label") or r.get("timestamp"),
+                    "close": r.get("close") or r.get("adjClose") or r.get("price"),
+                }
+            )
+        return out
+
+    # Fallback – chart endpoint (1day)
+    data2 = _get_json(f"historical-chart/1day/{symbol}", {"limit": int(limit)}) or []
+    out2: List[Dict[str, Any]] = []
+    for r in data2:
+        if r is None:
+            continue
+        out2.append(
+            {
+                "date": r.get("date") or r.get("label") or r.get("timestamp"),
+                "close": r.get("close") or r.get("adjClose") or r.get("price"),
+            }
+        )
+    return out2
+
+
+# -----------------------------------------------------------------------------
+# Financial statements
+# -----------------------------------------------------------------------------
+def income_statement(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
+    """
+    Returns a list (newest first) of income statement dicts.
+    period: 'annual' or 'quarter'
+    """
+    period = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"income-statement/{symbol}", {"period": period, "limit": int(limit)}) or []
+    return data if isinstance(data, list) else []
+
+
+def balance_sheet(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
+    """
+    Returns a list (newest first) of balance sheet dicts.
+    period: 'annual' or 'quarter'
+    """
+    period = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"balance-sheet-statement/{symbol}", {"period": period, "limit": int(limit)}) or []
+    return data if isinstance(data, list) else []
+
+
+def cash_flow(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
+    """
+    Returns a list (newest first) of cash flow statement dicts.
+    period: 'annual' or 'quarter'
+    """
+    period = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"cash-flow-statement/{symbol}", {"period": period, "limit": int(limit)}) or []
+    return data if isinstance(data, list) else []
+
+
+# -----------------------------------------------------------------------------
+# Metrics & ratios
+# -----------------------------------------------------------------------------
+def key_metrics(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
+    period = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"key-metrics/{symbol}", {"period": period, "limit": int(limit)}) or []
+    return data if isinstance(data, list) else []
+
+
+def key_metrics_ttm(symbol: str) -> Dict[str, Any]:
+    data = _get_json(f"key-metrics-ttm/{symbol}") or []
+    return _first(data)
+
+
+def ratios(symbol: str, period: str = "ttm", limit: int = 4) -> Dict[str, Any]:
+    """
+    Returns {"ratios": [...]} to match existing callers that do .get("ratios").
+    - period='ttm' uses /ratios-ttm
+    - otherwise uses /ratios?period={annual|quarter}
+    """
+    if period.lower() == "ttm":
+        data = _get_json(f"ratios-ttm/{symbol}") or []
+        return {"ratios": data if isinstance(data, list) else []}
+    per = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"ratios/{symbol}", {"period": per, "limit": int(limit)}) or []
+    return {"ratios": data if isinstance(data, list) else []}
+
+
+def enterprise_values(symbol: str, period: str = "annual", limit: int = 10) -> Dict[str, Any]:
+    """
+    Returns {"enterpriseValues": [...]} so callers can do .get("enterpriseValues").
+    """
+    per = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"enterprise-values/{symbol}", {"period": per, "limit": int(limit)}) or []
+    return {"enterpriseValues": data if isinstance(data, list) else []}
+
+
+# -----------------------------------------------------------------------------
+# SEC & outlook
+# -----------------------------------------------------------------------------
+def sec_filings(symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
+    data = _get_json(f"sec-filings/{symbol}", {"limit": int(limit)}) or []
+    return data if isinstance(data, list) else []
+
+
+def company_outlook(symbol: str) -> Dict[str, Any]:
+    data = _get_json("company-outlook", {"symbol": symbol}) or {}
+    # some accounts get {"profile": {...}, "ratios": {...}, ...}
+    return data if isinstance(data, dict) else {}
+
+
+# -----------------------------------------------------------------------------
+# Convenience helpers used in comps/valuation
+# -----------------------------------------------------------------------------
+def eps_ttm(symbol: str) -> Optional[float]:
+    km = key_metrics_ttm(symbol)
+    # FMP names can vary (epsTTM or trailingEps)
+    for k in ("epsTTM", "trailingEps", "eps"):
+        if km.get(k) is not None:
+            try:
+                return float(km[k])
+            except Exception:
+                pass
+    # fallback from ratios-ttm if present
+    r = ratios(symbol, period="ttm").get("ratios", [])
+    if r:
+        for k in ("priceEarningsRatioTTM", "peRatioTTM", "priceEarningsRatio"):
+            val = _first(r).get(k)
+            if val:
+                p = latest_price(symbol)
+                try:
+                    return float(p) / float(val) if p and val else None
+                except Exception:
+                    return None
+    return None
+
+
+def ebitda_ttm(symbol: str) -> Optional[float]:
+    # Try enterprise-values stream which sometimes includes EBITDA
+    ev = enterprise_values(symbol, period="annual", limit=1).get("enterpriseValues", [])
+    if ev:
+        for k in ("ebitda", "EBITDA"):
+            val = _first(ev).get(k)
+            if val is not None:
+                try:
+                    return float(val)
+                except Exception:
+                    pass
+    # Fallback via cash flow + income statement (rough)
+    inc = income_statement(symbol, period="annual", limit=1)
+    cf = cash_flow(symbol, period="annual", limit=1)
+    try:
+        i = _first(inc)
+        d_and_a = _first(cf).get("depreciationAndAmortization")
+        if i and i.get("operatingIncome") is not None and d_and_a is not None:
+            return float(i["operatingIncome"]) + float(d_and_a)
+    except Exception:
+        pass
+    return None
