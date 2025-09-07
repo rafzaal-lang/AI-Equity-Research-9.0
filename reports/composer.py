@@ -1,146 +1,75 @@
-# reports/composer.py
-# Compose a one-page equity research note (Markdown).
+# src/services/report/composer.py
+from typing import Any, Dict, Optional, List
 
-from __future__ import annotations
-from typing import Dict, Any, List, Optional
-
-def _money(x: Optional[float]) -> str:
+def _fmt_pct(x: Any, already_pct: bool = False) -> str:
     try:
-        return f"${float(x):,.0f}" if x is not None else "—"
+        if x is None:
+            return "–"
+        v = float(x) if already_pct else (float(x) * 100.0)
+        sign = "+" if v > 0 else ""
+        return f"{sign}{v:.1f}%"
     except Exception:
-        return "—"
+        return "–"
 
-def _num(x: Optional[float], nd=2) -> str:
-    try:
-        return f"{float(x):.{nd}f}"
-    except Exception:
-        return "—"
-
-def _pct(x: Optional[float], nd=2) -> str:
-    try:
-        return f"{float(x)*100:.{nd}f}%"
-    except Exception:
-        return "—"
-
-def _get(d: Dict[str, Any], *keys):
-    for k in keys:
-        if isinstance(d, dict) and (k in d):
-            return d[k]
-    return None
-
-def compose(payload: Dict[str, Any]) -> str:
+def compose(symbol: str, as_of: str, data: Optional[Dict[str, Any]] = None, **kwargs) -> str:
     """
-    Expected keys (all optional-safe):
-      - symbol: str
-      - as_of: str
-      - base_currency: str
-      - fundamentals: dict with revenue, ebit, net_income, fcf, gross_margin, op_margin, fcf_margin, roic, de_ratio
-      - dcf: dict or None
-      - valuation: {"wacc": float}
-      - comps: {"peers": [ {ticker, pe, ps, ev_ebitda, fcf_yield, market_cap}, ... ]}
-      - citations: [ {title, date, source_type, url}, ... ]
-      - quarter: {period, revenue_yoy, eps_yoy, op_income_yoy, notes}
+    Build a simple markdown research note. You can pass fields either via the
+    `data` dict or as keyword args.
+
+    Expected (optional) keys:
+      - highlights: List[str]
+      - momentum:  Dict with keys m5d, m3m, m6m, breadth50, breadth200
+      - valuation: str or markdown
+      - transcripts: str or markdown (e.g., analyst Q&A bullets)
+      - risks: List[str]
     """
-    out: List[str] = []
+    ctx: Dict[str, Any] = {}
+    if data:
+        ctx.update(data)
+    if kwargs:
+        ctx.update(kwargs)
 
-    sym = payload.get("symbol", "—")
-    as_of = payload.get("as_of", "latest")
-    base_ccy = payload.get("base_currency", "USD")
+    md: List[str] = [f"# {symbol} — Equity Research Note (as of {as_of})", ""]
 
-    out.append(f"# {sym} — Equity Research Note\n")
-    out.append(f"*As of:* `{as_of}`  ·  *Base currency:* *{base_ccy.lower()}*")
-    out.append("")
+    # Highlights
+    highlights = ctx.get("highlights") or []
+    if isinstance(highlights, list) and highlights:
+        md.append("## Highlights")
+        md.extend(f"- {b}" for b in highlights)
+        md.append("")
 
-    # Summary
-    val = payload.get("valuation") or {}
-    wacc = _get(val, "wacc")
-    dcf = payload.get("dcf") or {}
-    base = _get(dcf, "base")
-    low  = _get(dcf, "low")
-    high = _get(dcf, "high")
+    # Momentum snapshot
+    momentum = ctx.get("momentum") or {}
+    if isinstance(momentum, dict) and momentum:
+        m5d  = _fmt_pct(momentum.get("m5d"))
+        m3m  = _fmt_pct(momentum.get("m3m"))
+        m6m  = _fmt_pct(momentum.get("m6m"))
+        b50  = _fmt_pct(momentum.get("breadth50"), already_pct=True)
+        b200 = _fmt_pct(momentum.get("breadth200"), already_pct=True)
+        md.append("## Momentum Snapshot")
+        md.append(f"- 5D: {m5d} · 3M: {m3m} · 6M: {m6m}")
+        md.append(f"- Breadth: {b50} above 50DMA · {b200} above 200DMA")
+        md.append("")
 
-    out.append("## Summary")
-    out.append(f"- Estimated WACC: **{_pct(wacc, 2)}**")
-    out.append(f"- DCF Value (Low / Base / High): **{_money(low)} / {_money(base)} / {_money(high)}**")
-    out.append("")
+    # Valuation vs peers
+    valuation = ctx.get("valuation")
+    if valuation:
+        md.append("## Valuation vs Peers")
+        md.append(str(valuation).strip())
+        md.append("")
 
-    # Fundamentals
-    f = payload.get("fundamentals") or {}
-    rows = [
-        ("Revenue",        _money(_get(f, "revenue"))),
-        ("EBIT",           _money(_get(f, "ebit"))),
-        ("Net Income",     _money(_get(f, "net_income"))),
-        ("Free Cash Flow", _money(_get(f, "fcf"))),
-        ("Gross Margin",   _pct(_get(f, "gross_margin"))),
-        ("Operating Margin", _pct(_get(f, "op_margin"))),
-        ("FCF Margin",     _pct(_get(f, "fcf_margin"))),
-        ("ROIC",           _pct(_get(f, "roic"))),
-        ("Debt/Equity",    _num(_get(f, "de_ratio"))),
-    ]
+    # Transcript Q&A notes
+    transcripts = ctx.get("transcripts")
+    if transcripts:
+        md.append("## Transcript Q&A Notes")
+        md.append(str(transcripts).strip())
+        md.append("")
 
-    out.append("## Fundamentals (TTM / latest)")
-    out.append("")
-    out.append("| Metric | Value |")
-    out.append("|---|---|")
-    for k, v in rows:
-        out.append(f"| {k} | {v} |")
-    out.append("")
+    # Risks
+    risks = ctx.get("risks") or []
+    if isinstance(risks, list) and risks:
+        md.append("## Risks")
+        md.extend(f"- {r}" for r in risks)
+        md.append("")
 
-    # Valuation
-    out.append("## Valuation")
-    out.append(f"- **WACC:** {_pct(wacc, 2)}")
-    out.append(f"- **DCF Value (Low / Base / High):** {_money(low)} / {_money(base)} / {_money(high)}")
-    out.append("")
-
-    # Comps table
-    comps = (payload.get("comps") or {}).get("peers") or []
-    out.append("## Peers (selected)")
-    out.append("")
-    out.append("| Ticker | P/E | P/S | EV/EBITDA | FCF Yield | Market Cap |")
-    out.append("|---|---:|---:|---:|---:|---:|")
-    for r in comps:
-        out.append(
-            "| {t} | {pe} | {ps} | {ev} | {fcf} | {mc} |".format(
-                t=r.get("ticker", "—"),
-                pe=("—" if r.get("pe") is None else _num(r.get("pe"), 2)),
-                ps=("—" if r.get("ps") is None else _num(r.get("ps"), 2)),
-                ev=("—" if r.get("ev_ebitda") is None else _num(r.get("ev_ebitda"), 2)),
-                fcf=("—" if r.get("fcf_yield") is None else _pct(r.get("fcf_yield"), 2)),
-                mc=("—" if r.get("market_cap") is None else _money(r.get("market_cap"))),
-            )
-        )
-    out.append("")
-
-    # Latest quarter (optional)
-    q = payload.get("quarter") or {}
-    if q:
-        out.append("## Latest quarter")
-        period = q.get("period") or "—"
-        rev_yoy = q.get("revenue_yoy")
-        eps_yoy = q.get("eps_yoy")
-        opi_yoy = q.get("op_income_yoy")
-        out.append(
-            f"*Period:* `{period}`  •  *Revenue YoY:* {_pct(rev_yoy,1)}  •  "
-            f"*EPS YoY:* {_pct(eps_yoy,1)}  •  *OpInc YoY:* {_pct(opi_yoy,1)}"
-        )
-        if q.get("notes"):
-            out.append("")
-            out.append(q["notes"])
-        out.append("")
-
-    # Citations (optional)
-    cites = payload.get("citations") or []
-    if cites:
-        out.append("## Sources / Citations")
-        for c in cites:
-            title = c.get("title", "document")
-            typ = c.get("source_type", "")
-            date = c.get("date", "")
-            url = c.get("url", "")
-            if url:
-                out.append(f"- [{title}]({url}) — {typ} {date}".strip())
-            else:
-                out.append(f"- {title} — {typ} {date}".strip())
-        out.append("")
-
-    return "\n".join(out)
+    return "\n".join(md).strip()
