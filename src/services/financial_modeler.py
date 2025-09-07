@@ -12,6 +12,16 @@ def _num(x):
     try: return float(x) if x is not None else None
     except: return None
 
+def _safe_div(n, d):
+    try:
+        n = float(n)
+        d = float(d)
+        if d == 0:
+            return None
+        return n / d
+    except Exception:
+        return None
+
 def _to_df(rows: List[dict]) -> pd.DataFrame:
     """Convert list of dicts to DataFrame."""
     return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -47,14 +57,14 @@ def ttm_snapshot(symbol: str) -> Dict[str, Any]:
             "free_cash_flow": (operating_cf + capex) if operating_cf and capex else None,
         },
         "margins": {
-            "gross_margin": (gross_profit / revenue) if revenue and gross_profit else None,
-            "operating_margin": (operating_income / revenue) if revenue and operating_income else None,
-            "net_margin": (net_income / revenue) if revenue and net_income else None,
+            "gross_margin": _safe_div(gross_profit / revenue) if revenue and gross_profit else None,
+            "operating_margin": _safe_div(operating_income / revenue) if revenue and operating_income else None,
+            "net_margin": _safe_div(net_income / revenue) if revenue and net_income else None,
         },
         "ratios": {
-            "debt_to_equity": (total_debt / shareholders_equity) if total_debt and shareholders_equity else None,
-            "roa": (net_income / total_assets) if net_income and total_assets else None,
-            "roe": (net_income / shareholders_equity) if net_income and shareholders_equity else None,
+            "debt_to_equity": _safe_div(total_debt / shareholders_equity) if total_debt and shareholders_equity else None,
+            "roa": _safe_div(net_income / total_assets) if net_income and total_assets else None,
+            "roe": _safe_div(net_income / shareholders_equity) if net_income and shareholders_equity else None,
         }
     }
 
@@ -754,5 +764,6 @@ def comprehensive_financial_model(symbol: str, period: str = "annual",
     except Exception as e:
         logger.error(f"Error building comprehensive model for {symbol}: {e}")
         return {"symbol": symbol.upper(), "error": str(e)}
+
 
 
