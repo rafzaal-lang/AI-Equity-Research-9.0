@@ -12,6 +12,8 @@ from src.services.macro.snapshot import macro_snapshot
 from src.services.quant.signals import momentum, rsi, sma_cross
 from src.services.comps.engine import comps_table
 from src.services.providers import fmp_provider as fmp
+from src.services.ai.financial_analyst import ai_financial_analyst
+from src.services.ai.risk_analyzer import ai_risk_analyzer
 
 app = FastAPI(title="Reports Service")
 
@@ -152,4 +154,5 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
+
 
