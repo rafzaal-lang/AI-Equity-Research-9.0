@@ -6,6 +6,7 @@ from datetime import date
 from dataclasses import asdict, is_dataclass
 import math
 
+# ---------------- formatting helpers (unchanged semantics) ----------------
 def _fmt_money(x: Any) -> str:
     try:
         if x is None:
@@ -65,15 +66,43 @@ def _robust_peer_pe(peers: List[Dict[str, Any]], min_n: int = 3) -> Optional[flo
     mid = vals[k1:k2] or vals
     return sum(mid) / len(mid)
 
-def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, Any]] = None, **kwargs) -> str:
-    if not as_of:
-        as_of = date.today().isoformat()
+# ---------------- unified compose supporting both call styles ----------------
+def compose(symbol: Any, as_of: Optional[str] = None, data: Optional[Dict[str, Any]] = None, **kwargs) -> str:
+    """
+    Unified composer:
 
-    ctx: Dict[str, Any] = {}
-    if data:   ctx.update(data)
-    if kwargs: ctx.update(kwargs)
+    - New style: compose(payload_dict)
+      where payload_dict may include keys like:
+        symbol, as_of, fundamentals, dcf or dcf_valuation, comps, quarter,
+        ai_analysis {executive_summary, analyst_rating, price_target_range, key_insights}, etc.
 
-    fundamentals = (ctx.get("fundamentals") or {}).copy()
+    - Legacy style: compose(symbol_str, as_of=None, data=None, **kwargs)
+      where `data`/kwargs carry the same keys above.
+
+    Returns clean Markdown (never echoes the raw dict).
+    """
+    # Detect call style
+    if isinstance(symbol, dict):
+        # New: first arg is the payload
+        payload: Dict[str, Any] = dict(symbol)  # shallow copy
+        sym = str(payload.get("symbol") or "—").upper()
+        as_of_final = payload.get("as_of") or as_of or date.today().isoformat()
+        ctx: Dict[str, Any] = dict(payload)  # for convenience, same name as older code
+    else:
+        # Legacy style
+        sym = (str(symbol) if symbol is not None else "—").upper()
+        as_of_final = as_of or date.today().isoformat()
+        ctx: Dict[str, Any] = {}
+        if data:
+            ctx.update(data)
+        if kwargs:
+            ctx.update(kwargs)
+        # also allow legacy callers to pass fundamentals/dcf/etc directly via kwargs
+        ctx.setdefault("symbol", sym)
+        ctx.setdefault("as_of", as_of_final)
+
+    # -------- fundamentals / comps / dcf extraction (preserve your logic) --------
+    fundamentals = (ctx.get("fundamentals") or ctx.get("core_financials") or {}).copy()
     comps = (ctx.get("comps") or {}).copy()
     peers = comps.get("peers") or []
 
@@ -84,10 +113,11 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
 
     fcf_yield = fundamentals.get("fcf_yield")
     if fcf_yield is None:
-        fcf = fundamentals.get("fcf")
+        fcf = fundamentals.get("fcf") or fundamentals.get("free_cash_flow")
         if _is_pos_num(fcf) and _is_pos_num(mc):
             fcf_yield = float(fcf) / float(mc)
 
+    # Accept either dcf or dcf_valuation key
     dcf = ctx.get("dcf") or ctx.get("dcf_valuation") or {}
     dcf_ev = dcf.get("enterprise_value")
     dcf_eq = dcf.get("equity_value")
@@ -96,14 +126,17 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
     a = dcf.get("assumptions") or {}
     dcf_rg, dcf_dr, dcf_tg, dcf_years = a.get("revenue_growth"), a.get("discount_rate"), a.get("terminal_growth"), a.get("projection_years")
 
+    # AI analysis payload (kept)
     ai = _to_dict(ctx.get("ai_analysis"))
     ai_exec = ai.get("executive_summary")
     ai_rating = ai.get("analyst_rating")
     ai_targets = ai.get("price_target_range") or {}
     ai_insights = ai.get("key_insights") or []
 
-    md: List[str] = [f"# {symbol} — Equity Research Note *(as of {as_of})*", ""]
+    # -------------------------- build markdown --------------------------
+    md: List[str] = [f"# {sym} — Equity Research Note *(as of {as_of_final})*", ""]
 
+    # Snapshot
     if any([mc, ev, pe, fcf_yield, peer_pe_robust]):
         md.append("## Snapshot")
         if mc is not None: md.append(f"- **Market Cap:** {_fmt_money(mc)}")
@@ -113,6 +146,7 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
         if fcf_yield is not None: md.append(f"- **FCF Yield:** {_fmt_pct(fcf_yield)}")
         md.append("")
 
+    # Analyst View
     if ai_rating or ai_targets:
         md.append("## Analyst View")
         if ai_rating: md.append(f"- **Rating:** {ai_rating}")
@@ -121,10 +155,12 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
             md.append(f"- **Target Range (EV):** Low {low} · Base {base} · High {high}")
         md.append("")
 
+    # Executive Summary
     if ai_exec:
         md.append("## Executive Summary")
         md.append(ai_exec.strip()); md.append("")
 
+    # Key Insights (bucketed)
     if isinstance(ai_insights, list) and ai_insights:
         md.append("## Key Insights")
         buckets: Dict[str, List[str]] = {"strength": [], "opportunity": [], "weakness": [], "threat": []}
@@ -138,6 +174,7 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
                 md.extend(f"- {t}" for t in items)
         md.append("")
 
+    # DCF Summary
     if any([dcf_ev, dcf_eq, dcf_tv, dcf_tv_pct, a]):
         md.append("## DCF Summary")
         if any([dcf_ev, dcf_eq]): md.append(f"- **Enterprise Value:** {_fmt_money(dcf_ev)}  ·  **Equity Value:** {_fmt_money(dcf_eq)}")
@@ -148,6 +185,7 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
             md.append(f"- **Assumptions:** Rev growth {_fmt_pct(dcf_rg)} · Discount {_fmt_pct(dcf_dr)} · Terminal {_fmt_pct(dcf_tg)} · Years {yrs}")
         md.append("")
 
+    # Quarterly Update
     q = ctx.get("quarter") or {}
     if isinstance(q, dict) and any(q.get(k) is not None for k in ("period","revenue_yoy","eps_yoy","op_income_yoy","notes")):
         md.append("## Quarterly Update")
@@ -158,10 +196,12 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
         if q.get("notes"): md.append(f"- {_fmt_plain(q.get('notes'))}")
         md.append("")
 
+    # Highlights
     highlights = ctx.get("highlights") or []
     if isinstance(highlights, list) and highlights:
         md.append("## Highlights"); md.extend(f"- {b}" for b in highlights); md.append("")
 
+    # Legacy Momentum Snapshot (kept)
     momentum = ctx.get("momentum") or {}
     if isinstance(momentum, dict) and momentum:
         m5d  = _fmt_pct(momentum.get("m5d")); m3m = _fmt_pct(momentum.get("m3m")); m6m = _fmt_pct(momentum.get("m6m"))
@@ -171,11 +211,12 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
         md.append(f"- **Breadth:** {b50} above 50DMA · {b200} above 200DMA")
         md.append("")
 
+    # Valuation Notes
     valuation_note = ctx.get("valuation")
     if valuation_note:
         md.append("## Valuation Notes"); md.append(str(valuation_note).strip()); md.append("")
 
-    peers = comps.get("peers") or []
+    # Peer Snapshot
     if isinstance(peers, list) and peers:
         md.append("## Peer Snapshot")
         md.append("| Ticker | P/E | EV/EBITDA | P/S | Mkt Cap |")
@@ -185,21 +226,24 @@ def compose(symbol: str, as_of: Optional[str] = None, data: Optional[Dict[str, A
             md.append(f"| {p.get('ticker')} | {_fmt_ratio(p.get('pe'))} | {_fmt_ratio(p.get('ev_ebitda'))} | {_fmt_ratio(p.get('ps'))} | {_fmt_money(p.get('market_cap'))} |")
         md.append("")
 
+    # Transcripts
     transcripts = ctx.get("transcripts")
     if transcripts:
         md.append("## Transcript Q&A Notes"); md.append(str(transcripts).strip()); md.append("")
 
+    # Risks
     risks = ctx.get("risks") or []
     if isinstance(risks, list) and risks:
         md.append("## Risks"); md.extend(f"- {r}" for r in risks); md.append("")
 
+    # Citations
     citations = ctx.get("citations") or []
     if isinstance(citations, list) and citations:
         md.append("## Citations")
         for c in citations:
             if not isinstance(c, dict): continue
             title = c.get("title") or "Source"; url = c.get("url"); date_str = c.get("date"); src_type = c.get("source_type")
-            line = f"- **{title}**"; 
+            line = f"- **{title}**"
             if src_type: line += f" — {src_type}"
             if date_str: line += f" ({date_str})"
             if url: line += f" — [{url}]({url})"
