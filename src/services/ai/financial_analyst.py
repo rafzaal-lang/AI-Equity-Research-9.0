@@ -223,4 +223,184 @@ class AIFinancialAnalyst:
             "  \"insights\": [\n"
             "    {\n"
             "      \"category\": \"strength|weakness|opportunity|threat\",\n"
-            "      \"insight\": \"Clear, specific insight in 1-2 s
+            "      \"insight\": \"Clear, specific insight in 1-2 sentences\",\n"
+            "      \"supporting_data\": { \"metric\": \"value or note\" } ,\n"
+            "      \"confidence\": 0.0\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Do not include any extra keys."
+        )
+        
+        messages = [
+            {"role": "system", "content": "You are a precise equity research co-pilot. Always return strict JSON."},
+            {"role": "user", "content": (
+                f"Analyze {symbol}'s financial data and identify 4-6 key insights.\n"
+                f"Focus on profitability trends, cash generation, balance sheet, competitive stance, and growth sustainability.\n\n"
+                f"Financial Data:\n{financial_summary}\n\n"
+                f"{schema_hint}"
+            )}
+        ]
+
+        result = self._make_openai_request_json(messages, max_tokens=1200, temperature=0.2) or {}
+        raw_insights = result.get("insights") if isinstance(result, dict) else None
+        if not isinstance(raw_insights, list):
+            logger.warning(f"No structured insights parsed for {symbol}. Got keys: {list(result.keys()) if isinstance(result, dict) else 'n/a'}")
+            return []
+
+        insights: List[FinancialInsight] = []
+        for item in raw_insights:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category", "neutral"))
+            insight_text = str(item.get("insight", "")).strip()
+            supporting = item.get("supporting_data", {})
+            if not isinstance(supporting, (dict, str)):
+                supporting = {}
+            try:
+                confidence = float(item.get("confidence", 0.7))
+            except Exception:
+                confidence = 0.7
+            insights.append(FinancialInsight(
+                category=category,
+                insight=insight_text,
+                supporting_data=supporting,
+                confidence=confidence
+            ))
+        return insights
+    
+    def _generate_executive_summary(self, symbol: str, insights: List[FinancialInsight], 
+                                   fundamentals: Dict) -> str:
+        """AI generates executive summary based on insights."""
+        
+        if not insights:
+            return f"{symbol} analysis completed. Review detailed financial metrics below."
+        
+        insight_text = "\n".join([f"- {i.insight}" for i in insights if i.insight])
+        
+        def fmt_pct(x):
+            return f"{x:.1%}" if isinstance(x, (int, float)) else "N/A"
+        def fmt_num(x):
+            if isinstance(x, (int, float)):
+                return f"${x:,.0f}"
+            return "N/A"
+        
+        prompt = (
+            f"Write a 3-4 sentence executive summary for {symbol} based on these key insights:\n\n"
+            f"{insight_text}\n\n"
+            f"Key metrics: Revenue {fmt_num(fundamentals.get('revenue'))}, "
+            f"Net Margin {fmt_pct(fundamentals.get('net_margin'))}, "
+            f"ROE {fmt_pct(fundamentals.get('roe'))}.\n"
+            f"Style: Professional, concise, investment-focused. Lead with the investment conclusion."
+        )
+        
+        response = self._make_openai_request([{"role": "user", "content": prompt}], max_tokens=220)
+        if response:
+            return response
+        return f"{symbol} analysis completed. See detailed insights below."
+    
+    def _generate_investment_thesis(self, symbol: str, insights: List[FinancialInsight], 
+                                   financial_data: Dict) -> Dict[str, str]:
+        """AI generates bull and bear investment cases."""
+        
+        strengths = [i.insight for i in insights if i.category == "strength"]
+        weaknesses = [i.insight for i in insights if i.category == "weakness"]
+        opportunities = [i.insight for i in insights if i.category == "opportunity"]
+        threats = [i.insight for i in insights if i.category == "threat"]
+        
+        dcf_value = financial_data.get("dcf_valuation", {}).get("enterprise_value", 0)
+        if not isinstance(dcf_value, (int, float)):
+            dcf_value = 0
+        
+        bull_prompt = (
+            f"Create a bull case for {symbol} based on:\n"
+            f"Strengths: {'; '.join(strengths)}\n"
+            f"Opportunities: {'; '.join(opportunities)}\n"
+            f"DCF Enterprise Value: ${dcf_value:,.0f}\n"
+            f"Write 2-3 sentences focusing on upside catalysts and competitive advantages."
+        )
+        
+        bear_prompt = (
+            f"Create a bear case for {symbol} based on:\n"
+            f"Weaknesses: {'; '.join(weaknesses)}\n"
+            f"Threats: {'; '.join(threats)}\n"
+            f"Write 2-3 sentences focusing on downside risks and challenges."
+        )
+        
+        bull_response = self._make_openai_request([{"role": "user", "content": bull_prompt}], max_tokens=150)
+        bear_response = self._make_openai_request([{"role": "user", "content": bear_prompt}], max_tokens=150)
+        
+        return {
+            "bull_case": bull_response or "Upside potential based on financial strengths.",
+            "bear_case": bear_response or "Downside risks from market challenges."
+        }
+    
+    def _generate_rating_and_targets(self, symbol: str, dcf: Dict, 
+                                    insights: List[FinancialInsight]) -> Tuple[str, Dict[str, float]]:
+        """AI generates analyst rating and price targets."""
+        
+        strength_count = len([i for i in insights if i.category in ["strength", "opportunity"]])
+        weakness_count = len([i for i in insights if i.category in ["weakness", "threat"]])
+        net_positive = strength_count - weakness_count
+        
+        if net_positive >= 2:
+            rating = "Buy"
+        elif net_positive >= 0:
+            rating = "Hold"
+        else:
+            rating = "Sell"
+        
+        base_value = dcf.get("enterprise_value", 100000000)
+        if not isinstance(base_value, (int, float)):
+            base_value = 100000000
+        
+        price_targets = {
+            "low": float(base_value) * 0.85,
+            "base": float(base_value),
+            "high": float(base_value) * 1.15
+        }
+        
+        return rating, price_targets
+    
+    def _prepare_financial_summary(self, fundamentals: Dict, dcf: Dict, comps: Dict) -> str:
+        """Prepare financial data summary for AI analysis."""
+        
+        def fmt_num(x, is_pct=False):
+            if not isinstance(x, (int, float)):
+                return "N/A"
+            if is_pct:
+                return f"{x:.1%}"
+            return f"${x:,.0f}" if x >= 1000 else f"{x:.2f}"
+        
+        peer_pe = comps.get("peer_pe_robust")
+        if not isinstance(peer_pe, (int, float)):
+            peer_pe = None
+
+        summary = f"""
+        Revenue: {fmt_num(fundamentals.get('revenue'))}
+        Net Income: {fmt_num(fundamentals.get('net_income'))}
+        Free Cash Flow: {fmt_num(fundamentals.get('fcf'))}
+        
+        Margins:
+        - Gross: {fmt_num(fundamentals.get('gross_margin'), True)}
+        - Operating: {fmt_num(fundamentals.get('op_margin'), True)}
+        - Net: {fmt_num(fundamentals.get('net_margin'), True)}
+        
+        Returns:
+        - ROE: {fmt_num(fundamentals.get('roe'), True)}
+        - ROIC: {fmt_num(fundamentals.get('roic'), True)}
+        
+        Valuation:
+        - Enterprise Value: {fmt_num((dcf or {}).get('enterprise_value'))}
+        - Peer Average P/E (robust): {peer_pe if peer_pe is not None else 'N/A'}
+        """
+        return summary
+    
+    def _get_peer_average_pe(self, comps: Dict) -> Optional[float]:
+        """ kept for backward compatibility (not used anymore) """
+        peers = comps.get("peers", []) or []
+        pe_values = [p.get("pe") for p in peers if isinstance(p, dict) and isinstance(p.get("pe"), (int, float))]
+        return (sum(pe_values) / len(pe_values)) if pe_values else None
+
+# Global instance
+ai_financial_analyst = AIFinancialAnalyst()
