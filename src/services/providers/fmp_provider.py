@@ -32,7 +32,8 @@ _API_KEY = os.getenv("FMP_API_KEY")
 if not _API_KEY:
     log.warning("FMP_API_KEY is not set; live FMP calls will likely fail.")
 
-_DEFAULT_TIMEOUT = (5, 15)  # (connect, read)
+# requests timeout can be a (connect, read) tuple
+_DEFAULT_TIMEOUT = (5, 15)
 
 
 class FMPError(Exception):
@@ -44,24 +45,23 @@ def _get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     if params is None:
         params = {}
     if _API_KEY:
-        # FMP accepts both 'apikey' and 'apikey=' – use 'apikey'
+        # FMP expects 'apikey' param
         params.setdefault("apikey", _API_KEY)
 
-    url = f"{_BASE.rstrip('/')}/{path.lstrip('/')}"
-      try:
+    url = f"{_BASE.rstrip('/')}/{path.strip('/')}"
+    try:
         resp = requests.get(url, params=params, timeout=_DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        # Add response text if present
+        # Add response text if present (best-effort)
         body = ""
         try:
-            body = f" body={resp.text[:300]}" if 'resp' in locals() else ""
+            body = f" body={resp.text[:300]!r}" if "resp" in locals() and hasattr(resp, "text") else ""
         except Exception:
             pass
-        log.warning("FMP GET failed: %s %s -> %s%s", url, params, e, body)
+        log.warning("FMP GET failed: url=%s params=%s err=%s%s", url, params, e, body)
         return None
-
 
 
 def _first(lst: Any) -> Dict[str, Any]:
@@ -86,11 +86,17 @@ def latest_price(symbol: str) -> Optional[float]:
     data = _get_json(f"quote-short/{symbol}") or []
     price = _first(data).get("price")
     if price is not None:
-        return float(price)
+        try:
+            return float(price)
+        except Exception:
+            pass
     # Fallback to full quote
     q = quote(symbol)
     if q and q.get("price") is not None:
-        return float(q["price"])
+        try:
+            return float(q["price"])
+        except Exception:
+            pass
     return None
 
 
@@ -98,10 +104,16 @@ def market_cap(symbol: str) -> Optional[float]:
     q = quote(symbol)
     mc = q.get("marketCap")
     if mc is not None:
-        return float(mc)
+        try:
+            return float(mc)
+        except Exception:
+            pass
     p = profile(symbol)
     mc = p.get("mktCap")
-    return float(mc) if mc is not None else None
+    try:
+        return float(mc) if mc is not None else None
+    except Exception:
+        return None
 
 
 def shares_outstanding(symbol: str) -> Optional[float]:
@@ -142,9 +154,9 @@ def historical_prices(symbol: str, limit: int = 300) -> List[Dict[str, Any]]:
     hist = data.get("historical")
     if isinstance(hist, list) and hist:
         # normalize keys -> {date, close}
-        out = []
+        out: List[Dict[str, Any]] = []
         for r in hist:
-            if r is None:
+            if not isinstance(r, dict):
                 continue
             out.append(
                 {
@@ -157,8 +169,8 @@ def historical_prices(symbol: str, limit: int = 300) -> List[Dict[str, Any]]:
     # Fallback – chart endpoint (1day)
     data2 = _get_json(f"historical-chart/1day/{symbol}", {"limit": int(limit)}) or []
     out2: List[Dict[str, Any]] = []
-    for r in data2:
-        if r is None:
+    for r in data2 if isinstance(data2, list) else []:
+        if not isinstance(r, dict):
             continue
         out2.append(
             {
@@ -177,8 +189,8 @@ def income_statement(symbol: str, period: str = "annual", limit: int = 4) -> Lis
     Returns a list (newest first) of income statement dicts.
     period: 'annual' or 'quarter'
     """
-    period = "quarter" if period.lower().startswith("q") else "annual"
-    data = _get_json(f"income-statement/{symbol}", {"period": period, "limit": int(limit)}) or []
+    per = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"income-statement/{symbol}", {"period": per, "limit": int(limit)}) or []
     return data if isinstance(data, list) else []
 
 
@@ -187,8 +199,8 @@ def balance_sheet(symbol: str, period: str = "annual", limit: int = 4) -> List[D
     Returns a list (newest first) of balance sheet dicts.
     period: 'annual' or 'quarter'
     """
-    period = "quarter" if period.lower().startswith("q") else "annual"
-    data = _get_json(f"balance-sheet-statement/{symbol}", {"period": period, "limit": int(limit)}) or []
+    per = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"balance-sheet-statement/{symbol}", {"period": per, "limit": int(limit)}) or []
     return data if isinstance(data, list) else []
 
 
@@ -197,8 +209,8 @@ def cash_flow(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[
     Returns a list (newest first) of cash flow statement dicts.
     period: 'annual' or 'quarter'
     """
-    period = "quarter" if period.lower().startswith("q") else "annual"
-    data = _get_json(f"cash-flow-statement/{symbol}", {"period": period, "limit": int(limit)}) or []
+    per = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"cash-flow-statement/{symbol}", {"period": per, "limit": int(limit)}) or []
     return data if isinstance(data, list) else []
 
 
@@ -206,8 +218,8 @@ def cash_flow(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[
 # Metrics & ratios
 # -----------------------------------------------------------------------------
 def key_metrics(symbol: str, period: str = "annual", limit: int = 4) -> List[Dict[str, Any]]:
-    period = "quarter" if period.lower().startswith("q") else "annual"
-    data = _get_json(f"key-metrics/{symbol}", {"period": period, "limit": int(limit)}) or []
+    per = "quarter" if period.lower().startswith("q") else "annual"
+    data = _get_json(f"key-metrics/{symbol}", {"period": per, "limit": int(limit)}) or []
     return data if isinstance(data, list) else []
 
 
@@ -301,4 +313,3 @@ def ebitda_ttm(symbol: str) -> Optional[float]:
     except Exception:
         pass
     return None
-
