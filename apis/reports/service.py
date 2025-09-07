@@ -4,14 +4,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 from datetime import datetime, date
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs
 
-from fastapi import FastAPI, HTTPException, Response, Request, Query
+from fastapi import FastAPI, HTTPException, Response, Request, Query, Body
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.services.report.composer import compose
@@ -34,73 +31,161 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
-VERSION = "9.6"
-
 app = FastAPI(title="Reports Service")
 
-# Permissive CORS for UI
+# Permissive CORS (tighten allow_origins if you have a fixed UI origin)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your UI origin if desired
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+STRICT_INPUTS = os.getenv("STRICT_REPORT_INPUTS", "false").lower() == "true"
+DEFAULT_TICKER = os.getenv("DEFAULT_TICKER", "AAPL").strip() or "AAPL"
+
 class ReportResponse(BaseModel):
     symbol: str
     markdown: str
 
-# --------------------------------------------------------------------------------------
-# Global softeners: keep requests from failing hard with 400/422
-# --------------------------------------------------------------------------------------
-@app.exception_handler(RequestValidationError)
-async def _validation_softener(request: Request, exc: RequestValidationError):
-    # If anything tries to 422/400 due to body shape, return a default report instead
-    print(f"[reports] validation_softener on {request.url.path}: {exc}")
-    sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+class ReportRequest(BaseModel):
+    ticker: Optional[str] = Field(default=None)
+    symbol: Optional[str] = Field(default=None)
+
+    def get_symbol(self) -> str:
+        return (self.ticker or self.symbol or "").strip()
+
+# ----------------------------- Utilities ------------------------------------
+_TICKER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$")  # allows BRK.B, RDS-A, SHOP, MSFT
+
+def _looks_like_ticker(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    if not s or len(s) > 10:
+        return False
+    return bool(_TICKER_RE.match(s))
+
+def _deep_find_ticker(obj: Any) -> Optional[str]:
+    """Recursively search any JSON-like structure for a plausible ticker."""
     try:
-        md = _build_report_markdown(sym)
-        return JSONResponse({"symbol": sym, "markdown": md})
-    except Exception as e:
-        return JSONResponse({"detail": f"softened validation error: {e}"}, status_code=500)
+        if isinstance(obj, str) and _looks_like_ticker(obj):
+            return obj.strip()
+        if isinstance(obj, dict):
+            # common keys first
+            for k in ("ticker", "symbol", "t", "s", "security", "equity", "name", "q"):
+                if k in obj and _looks_like_ticker(str(obj[k])):
+                    return str(obj[k]).strip()
+            # any value
+            for v in obj.values():
+                found = _deep_find_ticker(v)
+                if found:
+                    return found
+        if isinstance(obj, list):
+            for v in obj:
+                found = _deep_find_ticker(v)
+                if found:
+                    return found
+    except Exception:
+        pass
+    return None
 
-@app.exception_handler(StarletteHTTPException)
-async def _http_softener(request: Request, exc: StarletteHTTPException):
-    # If it's a 400 on /report, try to recover by producing a default report
-    if request.url.path.rstrip("/") == "/report" and exc.status_code == 400:
-        print(f"[reports] http_softener recovered 400 for /report: {exc.detail}")
-        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+async def _extract_symbol(request: Request,
+                          ticker_body: Optional[str],
+                          symbol_body: Optional[str],
+                          ticker_q: Optional[str],
+                          symbol_q: Optional[str]) -> Optional[str]:
+    # 1) direct body fields from Body(...)
+    sym = (ticker_body or symbol_body or "").strip()
+
+    # 2) headers
+    if not sym:
+        headers = request.headers
+        for hk in ("x-ticker", "x-symbol", "ticker", "symbol"):
+            hv = headers.get(hk)
+            if hv and _looks_like_ticker(hv):
+                sym = hv.strip()
+                break
+
+    # 3) JSON body
+    if not sym:
         try:
-            md = _build_report_markdown(sym)
-            return JSONResponse({"symbol": sym, "markdown": md})
-        except Exception as e:
-            return JSONResponse({"detail": f"softened http error: {e}"}, status_code=500)
-    # otherwise pass through
-    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            data = await request.json()
+            if isinstance(data, dict):
+                # quick keys
+                for k in ("ticker", "symbol", "t", "s", "q", "equity", "security"):
+                    if k in data and _looks_like_ticker(str(data[k])):
+                        sym = str(data[k]).strip()
+                        break
+                # deep search
+                if not sym:
+                    found = _deep_find_ticker(data)
+                    if found:
+                        sym = found.strip()
+            elif isinstance(data, str) and _looks_like_ticker(data):
+                sym = data.strip()
+        except Exception:
+            pass
 
-# --------------------------------------------------------------------------------------
-# ROOT & HEALTH
-# --------------------------------------------------------------------------------------
+    # 4) form-data
+    if not sym:
+        try:
+            form = await request.form()
+            # case-insensitive scan
+            for k, v in form.multi_items():
+                if _looks_like_ticker(str(v)):
+                    sym = str(v).strip()
+                    break
+        except Exception:
+            pass
+
+    # 5) querystring
+    if not sym:
+        for v in (ticker_q, symbol_q, request.query_params.get("t"), request.query_params.get("s"), request.query_params.get("q")):
+            if v and _looks_like_ticker(v):
+                sym = v.strip()
+                break
+
+    # 6) raw text fallback
+    if not sym:
+        try:
+            raw = (await request.body()).decode(errors="ignore").strip()
+            if raw:
+                # try raw as JSON first
+                try:
+                    obj = json.loads(raw)
+                    found = _deep_find_ticker(obj)
+                    if found:
+                        sym = found.strip()
+                except Exception:
+                    if _looks_like_ticker(raw):
+                        sym = raw
+        except Exception:
+            pass
+
+    # 7) default
+    if not sym and not STRICT_INPUTS:
+        sym = DEFAULT_TICKER
+
+    return sym
+
+# ----------------------------- Root & Health --------------------------------
 @app.get("/")
 def root():
     return {
         "service": "AI Equity Research - Reports Service",
-        "version": VERSION,
+        "version": "9.2",
         "status": "healthy",
         "endpoints": {
             "health": "/v1/health",
             "report_get": "/v1/report/{ticker}",
-            "report_post": "/report (POST), /v1/report (POST), /report (GET), /report/{ticker} (POST), /report/ (POST)",
+            "report_post": "/report (POST), /v1/report (POST), /report (GET)",
             "ai_analysis": "/v1/ai-analysis/{ticker}",
             "metrics": "/metrics",
-            "docs": "/docs",
-        },
+            "docs": "/docs"
+        }
     }
-
-@app.get("/version")
-def version():
-    return {"version": VERSION}
 
 @app.get("/health")
 def health_simple():
@@ -114,16 +199,12 @@ def health():
 def favicon():
     return Response(status_code=204)
 
-# --------------------------------------------------------------------------------------
-# METRICS
-# --------------------------------------------------------------------------------------
+# ----------------------------- Metrics --------------------------------------
 @app.get("/metrics")
 def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-# --------------------------------------------------------------------------------------
-# DEBUG
-# --------------------------------------------------------------------------------------
+# ----------------------------- Debug ----------------------------------------
 @app.get("/debug/apis")
 def debug_apis():
     return {
@@ -164,8 +245,7 @@ def test_individual_apis(ticker: str):
         results["openai"] = f"FAILED: {e}"
     try:
         model = build_model(ticker)
-        err = model.get("error") if isinstance(model, dict) else None
-        results["financial_model"] = "SUCCESS" if not err else f"ERROR_VALUE:{err!r}"
+        results["financial_model"] = "SUCCESS" if model and "error" not in model else "NO_DATA"
     except Exception as e:
         results["financial_model"] = f"FAILED: {e}"
     try:
@@ -175,142 +255,22 @@ def test_individual_apis(ticker: str):
         results["comps"] = f"FAILED: {e}"
     return results
 
-# --------------------------------------------------------------------------------------
-# Body parsing helpers (zero reliance on request.form())
-# --------------------------------------------------------------------------------------
-_TICKER_GUESS_RE = re.compile(r"[A-Za-z]{1,6}(\.[A-Za-z]{1,3})?")
-
-def _guess_ticker_from_text(text: str) -> Optional[str]:
-    m = _TICKER_GUESS_RE.search(text or "")
-    return m.group(0).upper() if m else None
-
-async def _extract_symbol_from_request(request: Request) -> str:
-    """
-    Avoids Starlette's form parser entirely. Reads raw body bytes, tries:
-    1) JSON   2) urlencoded  3) text regex
-    Always returns something (defaulting to env or AAPL).
-    """
-    ctype = (request.headers.get("content-type") or "").lower()
-    try:
-        raw = (await request.body()) or b""
-    except Exception:
-        raw = b""
-    sample = raw[:256].decode(errors="ignore")
-    print(f"[reports] compat hit; ctype={ctype} sample={sample!r}")
-
-    # JSON
-    if "json" in ctype:
-        try:
-            data = json.loads(raw.decode(errors="ignore"))
-            if isinstance(data, dict):
-                for k in ("ticker", "symbol", "t", "s", "security", "code"):
-                    v = data.get(k)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip().upper()
-            elif isinstance(data, str) and data.strip():
-                return data.strip().upper()
-        except Exception:
-            pass
-
-    # urlencoded (we parse manually; no starlette form parser)
-    if "application/x-www-form-urlencoded" in ctype:
-        try:
-            kv = parse_qs(raw.decode(errors="ignore"), keep_blank_values=True)
-            for k in ("ticker", "symbol", "t", "s", "code"):
-                arr = kv.get(k)
-                if arr and isinstance(arr[0], str) and arr[0].strip():
-                    return arr[0].strip().upper()
-        except Exception:
-            pass
-
-    # text/plain or anything else: regex guess
-    tick = _guess_ticker_from_text(sample or "")
-    if tick:
-        return tick
-
-    return os.getenv("DEFAULT_TICKER", "AAPL").upper()
-
-# --------------------------------------------------------------------------------------
-# REPORT BUILDING
-# --------------------------------------------------------------------------------------
-def _build_report_markdown(ticker: str) -> str:
-    model = build_model(ticker)
-
-    # Only treat as error if the error value is meaningful/truthy
-    if isinstance(model, dict):
-        err = model.get("error", None)
-        if err not in (None, "", 0, False):
-            raise HTTPException(status_code=404, detail=str(err))
-    else:
-        print(f"[reports] build_model returned non-dict for {ticker}: {type(model).__name__}")
-
-    macro = macro_snapshot()
-
-    # Prices for quant signals
-    try:
-        hist = fmp.historical_prices(ticker, limit=300) or []
-    except Exception as e:
-        print(f"[reports] historical_prices failed for {ticker}: {e}")
-        hist = []
-
-    try:
-        q_mom = momentum(hist) if hist else {}
-    except Exception as e:
-        print(f"[reports] momentum failed for {ticker}: {e}")
-        q_mom = {}
-    try:
-        q_rsi = rsi(hist) if hist else {}
-    except Exception as e:
-        print(f"[reports] rsi failed for {ticker}: {e}")
-        q_rsi = {}
-    try:
-        q_sma = sma_cross(hist) if hist else {}
-    except Exception as e:
-        print(f"[reports] sma_cross failed for {ticker}: {e}")
-        q_sma = {}
-
-    md = compose(
-        ticker.upper(),
-        as_of=(macro or {}).get("as_of") or date.today().isoformat(),
-        data={
-            "call": "Review",
-            "conviction": 6.5,
-            "target_low": "—",
-            "target_high": "—",
-            "momentum": q_mom,  # composer expects 'momentum' at top-level
-            "fundamentals": (model or {}).get("core_financials", {}) if isinstance(model, dict) else {},
-            "dcf":          (model or {}).get("dcf_valuation", {}) if isinstance(model, dict) else {},
-            "valuation":    (model or {}).get("valuation", {})      if isinstance(model, dict) else {},
-            "comps": {
-                "peers": ((model or {}).get("comps", {}) if isinstance(model, dict) else {}).get("peers")
-                         or (comps_table(ticker) or {}).get("peers", [])
-            },
-            "quarter": (model or {}).get("quarter", {}) if isinstance(model, dict) else {},
-            "citations": (model or {}).get("citations", []) if isinstance(model, dict) else [],
-            "risks": (model or {}).get("risks", []) if isinstance(model, dict) else [],
-        },
-    )
-    return md
-
-# --------------------------------------------------------------------------------------
-# AI-ONLY ANALYSIS (JSON)
-# --------------------------------------------------------------------------------------
+# ----------------------------- AI-only JSON ---------------------------------
 @app.get("/v1/ai-analysis/{ticker}")
 def get_ai_analysis(ticker: str):
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=400, detail="OpenAI API key required")
     if ai_financial_analyst is None:
         raise HTTPException(status_code=500, detail="AI analyst not available")
+
     try:
         model = build_model(ticker)
-        if isinstance(model, dict):
-            err = model.get("error", None)
-            if err not in (None, "", 0, False):
-                raise HTTPException(status_code=404, detail=str(err))
+        if "error" in model:
+            raise HTTPException(status_code=404, detail=model["error"])
         comp = comps_table(ticker)
         financial_data = {
-            "fundamentals": (model or {}).get("core_financials", {}) if isinstance(model, dict) else {},
-            "dcf_valuation": (model or {}).get("dcf_valuation", {}) if isinstance(model, dict) else {},
+            "fundamentals": model.get("core_financials", {}),
+            "dcf_valuation": model.get("dcf_valuation", {}),
             "comps": comp,
         }
         analysis = ai_financial_analyst.analyze_company(ticker, financial_data)
@@ -326,9 +286,57 @@ def get_ai_analysis(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --------------------------------------------------------------------------------------
-# FULL REPORT (GET & POST) – ULTRA-FORGIVING
-# --------------------------------------------------------------------------------------
+# ----------------------------- Report Builder -------------------------------
+def _build_report_markdown(ticker: str) -> str:
+    model = build_model(ticker)
+    if "error" in model:
+        raise HTTPException(status_code=404, detail=model["error"])
+
+    macro = macro_snapshot()
+
+    # Prices for quant signals
+    try:
+        hist = fmp.historical_prices(ticker, limit=300) or []
+    except Exception:
+        hist = []
+
+    try:
+        q_mom = momentum(hist) if hist else {}
+    except Exception:
+        q_mom = {}
+    try:
+        q_rsi = rsi(hist) if hist else {}
+    except Exception:
+        q_rsi = {}
+    try:
+        q_sma = sma_cross(hist) if hist else {}
+    except Exception:
+        q_sma = {}
+
+    md = compose(
+        ticker.upper(),
+        as_of=(macro or {}).get("as_of") or date.today().isoformat(),
+        data={
+            "call": "Review",
+            "conviction": 6.5,
+            "target_low": "—",
+            "target_high": "—",
+            "momentum": q_mom,  # composer expects 'momentum' at top-level
+            "fundamentals": model.get("core_financials", {}),
+            "dcf": model.get("dcf_valuation", {}),
+            "valuation": model.get("valuation", {}),
+            "comps": {
+                "peers": (model.get("comps") or {}).get("peers")
+                         or (comps_table(ticker) or {}).get("peers", [])
+            },
+            "quarter": model.get("quarter", {}),
+            "citations": model.get("citations", []),
+            "risks": model.get("risks", []),
+        },
+    )
+    return md
+
+# ----------------------------- Full Report (GET & POST) ---------------------
 @app.get("/v1/report/{ticker}", response_model=ReportResponse)
 def get_report_v1(ticker: str):
     try:
@@ -339,85 +347,64 @@ def get_report_v1(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# GET /report?ticker=AAPL
+# GET /report?ticker=AAPL (compat)
 @app.get("/report", response_model=ReportResponse)
-def get_report_qs(ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
-    sym = (ticker or symbol or os.getenv("DEFAULT_TICKER", "AAPL")).strip().upper()
+def get_report_compat(ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
+    sym = (ticker or symbol or "").strip() or (DEFAULT_TICKER if not STRICT_INPUTS else "")
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
     try:
         md = _build_report_markdown(sym)
-        return ReportResponse(symbol=sym, markdown=md)
+        return ReportResponse(symbol=sym.upper(), markdown=md)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /v1/report (JSON: {"ticker":"AAPL"} or {"symbol":"AAPL"})
+# POST /v1/report with JSON body
 @app.post("/v1/report", response_model=ReportResponse)
-async def post_report_v1(request: Request):
-    # parse JSON leniently
-    sym = ""
-    try:
-        data = await request.body()
-        if data:
-            obj = json.loads(data.decode(errors="ignore"))
-            if isinstance(obj, dict):
-                sym = (obj.get("ticker") or obj.get("symbol") or "").strip().upper()
-            elif isinstance(obj, str):
-                sym = obj.strip().upper()
-    except Exception:
-        sym = ""
+def post_report_v1(req: ReportRequest):
+    sym = req.get_symbol() or (DEFAULT_TICKER if not STRICT_INPUTS else "")
     if not sym:
-        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
     try:
         md = _build_report_markdown(sym)
-        return ReportResponse(symbol=sym, markdown=md)
+        return ReportResponse(symbol=sym.upper(), markdown=md)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /report and /report/ – **no** Body parsers used
+# POST /report – accepts JSON, form-data, headers, querystring, or raw body
 @app.post("/report", response_model=ReportResponse)
-@app.post("/report/", response_model=ReportResponse)
-async def post_report_compat(request: Request, ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
-    print("[reports] /report compat endpoint invoked")
-    # 1) Querystring wins if present
-    sym = (ticker or symbol or "").strip().upper()
+async def post_report_compat(
+    request: Request,
+    ticker_body: Optional[str] = Body(default=None),
+    symbol_body: Optional[str] = Body(default=None),
+    ticker_q: Optional[str] = Query(default=None),
+    symbol_q: Optional[str] = Query(default=None),
+):
+    sym = await _extract_symbol(request, ticker_body, symbol_body, ticker_q, symbol_q)
 
-    # 2) Otherwise, try to extract from raw body (JSON/urlencoded/text)
     if not sym:
-        sym = await _extract_symbol_from_request(request)
-
-    # 3) Final fallback
-    if not sym:
-        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+        # brief diagnostic (sanitized) to help debug without dumping full payloads
+        try:
+            body_preview = (await request.body())[:200]
+        except Exception:
+            body_preview = b""
+        log.info("POST /report missing ticker. headers=%s query=%s body_preview=%s",
+                 dict(request.headers), dict(request.query_params), body_preview)
+        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
 
     try:
         md = _build_report_markdown(sym)
-        return JSONResponse(
-            content=ReportResponse(symbol=sym, markdown=md).model_dump(),
-            headers={"X-Report-Symbol": sym}
-        )
+        return ReportResponse(symbol=sym.upper(), markdown=md)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /report/{ticker}
-@app.post("/report/{ticker}", response_model=ReportResponse)
-async def post_report_with_path(ticker: str):
-    sym = (ticker or os.getenv("DEFAULT_TICKER", "AAPL")).strip().upper()
-    try:
-        md = _build_report_markdown(sym)
-        return ReportResponse(symbol=sym, markdown=md)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --------------------------------------------------------------------------------------
-# DEV ENTRYPOINT
-# --------------------------------------------------------------------------------------
+# ----------------------------- Dev Entrypoint -------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8086")))
