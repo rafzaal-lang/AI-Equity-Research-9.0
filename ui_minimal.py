@@ -35,12 +35,10 @@ try:
     from reports.composer import compose as compose_report
     from src.services.macro.snapshot import macro_snapshot
     from src.services.quant.signals import momentum as signal_momentum
-    # optional utils if present in your repo
     try:
-        from src.services.quant.signals import rsi as signal_rsi, sma_cross as signal_sma_cross
-    except Exception:  # optional
+        from src.services.quant.signals import rsi as signal_rsi
+    except Exception:
         signal_rsi = None
-        signal_sma_cross = None
     from src.services.providers import fmp_provider as fmp
 except ImportError as e:
     logger.error("Import error: %s", e)
@@ -84,26 +82,22 @@ def _html_error(note: str, status: int = 502) -> HTMLResponse:
     block = f'<pre class="muted" style="white-space:pre-wrap">{escape(note)}</pre>'
     return HTMLResponse(f"<html><body><h1>Error</h1>{block}</body></html>", status_code=status)
 
-# ---------- Math helpers for momentum ----------
+# ---------- Momentum helpers ----------
 def _sma(values: List[float], window: int) -> Optional[float]:
     if not values or len(values) < window:
         return None
     return sum(values[-window:]) / float(window)
 
 def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    """If your repo exposes signal_rsi(hist), we prefer it. Otherwise, simple RSI from closes."""
     if signal_rsi:
         try:
-            # Expecting hist like [{'date':..., 'close':...}, ...]
             hist = [{"close": c} for c in closes]
             out = signal_rsi(hist, period=period)
-            # your helper may return a dict or simple value; handle both
             if isinstance(out, dict) and "rsi" in out:
                 return float(out["rsi"])
             return float(out)
         except Exception:
             pass
-    # fallback RSI
     if len(closes) < period + 1:
         return None
     gains, losses = [], []
@@ -117,13 +111,11 @@ def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
-# ---------- Optional LLM commentary ----------
+# ---------- LLM commentary ----------
 def _llm_commentary(prompt: str) -> Optional[str]:
-    """Return short commentary from OpenAI if available; otherwise None."""
     if not OPENAI_API_KEY:
         return None
     try:
-        # OpenAI >= 1.0 style
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
         resp = client.chat.completions.create(
@@ -141,23 +133,35 @@ def _llm_commentary(prompt: str) -> Optional[str]:
         logger.warning("LLM commentary failed: %s", e)
         return None
 
+def _bulletize(text: str) -> str:
+    """Force bullet formatting for LLM text or plain sentences."""
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # If it's a single paragraph, naively split sentences.
+    if len(lines) <= 1 and "." in text:
+        parts = [p.strip() for p in text.replace("\n", " ").split(".") if p.strip()]
+        lines = parts
+    bullets = []
+    for ln in lines:
+        if ln.startswith(("-", "•")):
+            bullets.append("- " + ln.lstrip("-• ").strip())
+        else:
+            bullets.append("- " + ln)
+    return "\n".join(bullets)
+
 def _rule_based_summary(f: Dict[str, Any], dcf: Dict[str, Any], price_note: str | None, trend_note: str | None) -> str:
     rep = (f or {}).get("reported", {})
     margins = (f or {}).get("margins", {})
     ratios = (f or {}).get("ratios", {})
-
     rev = rep.get("revenue")
     gm = margins.get("gross_margin"); om = margins.get("operating_margin"); nm = margins.get("net_margin")
     dte = ratios.get("debt_to_equity"); roe = ratios.get("roe")
     tv_pct = dcf.get("terminal_value_pct")
-
     bullets = []
-    if price_note:
-        bullets.append(price_note)
-    if trend_note:
-        bullets.append(trend_note)
-    if rev:
-        bullets.append(f"Scale: { _fmt_money(rev, BASE_CURRENCY) } TTM revenue.")
+    if price_note: bullets.append(price_note)
+    if trend_note: bullets.append(trend_note)
+    if rev: bullets.append(f"Scale: { _fmt_money(rev, BASE_CURRENCY) } TTM revenue.")
     if gm is not None and om is not None and nm is not None:
         bullets.append(f"Margins: { _fmt_pct(gm) } gross / { _fmt_pct(om) } operating / { _fmt_pct(nm) } net.")
     if roe is not None:
@@ -166,21 +170,16 @@ def _rule_based_summary(f: Dict[str, Any], dcf: Dict[str, Any], price_note: str 
         bullets.append(f"Leverage { _fmt_num(dte,2) }× D/E.")
     if tv_pct is not None:
         bullets.append(f"Terminal value is { _fmt_pct(tv_pct) } of EV, consistent with a mature profile.")
-    if not bullets:
-        bullets.append("Key operating and valuation metrics available below.")
-    return "- " + "\n- ".join(bullets)
+    return "\n".join("- " + b for b in bullets) if bullets else "- Key operating and valuation metrics available below."
 
-# ---------- Peer comps (best-effort) ----------
+# ---------- Peer comps ----------
 def _fetch_peers(symbol: str) -> List[str]:
-    """Try to derive peer tickers. If helper not present, return [] safely."""
     try:
         prof = fmp.profile(symbol) or {}
         sector, industry = prof.get("sector"), prof.get("industry")
-        # Some repos implement a peers_by_screener helper
         if sector and industry and hasattr(fmp, "peers_by_screener"):
             peers = fmp.peers_by_screener(sector, industry, limit=12)
-            # Remove self symbol, unique + uppercase
-            uniq = []
+            uniq: List[str] = []
             for s in peers or []:
                 s2 = (s or "").upper()
                 if s2 and s2 != symbol.upper() and s2 not in uniq:
@@ -196,12 +195,11 @@ def _build_peer_rows(tickers: List[str]) -> List[List[str]]:
         try:
             q = fmp.quote(sym) or {}
             km = fmp.key_metrics_ttm(sym) or {}
-            if isinstance(km, list):  # be liberal
+            if isinstance(km, list):
                 km = km[0] if km else {}
             ratios = fmp.ratios(sym, period="ttm").get("ratios") or []
             r0 = ratios[0] if ratios else {}
-
-            pe = r0.get("priceEarningsRatioTTM") or r0.get("priceEarningsRatio")
+            pe  = r0.get("priceEarningsRatioTTM") or r0.get("priceEarningsRatio")
             roe = km.get("roeTTM"); gm = km.get("grossProfitMarginTTM"); om = km.get("operatingProfitMarginTTM")
             mcap = q.get("marketCap")
             rows.append([
@@ -213,20 +211,34 @@ def _build_peer_rows(tickers: List[str]) -> List[List[str]]:
                 _fmt_money(mcap, BASE_CURRENCY, 0) if mcap is not None else "—",
             ])
         except Exception:
-            # skip bad peer silently
             continue
     return rows
+
+# ---------- Composer sanitizer ----------
+def _clean_composer_markdown(md_core: str, ticker: str) -> str:
+    """
+    Some composer builds start with a printed dict before the title.
+    If markdown begins with '{', drop that first line and inject a clean title.
+    """
+    if not isinstance(md_core, str):
+        return ""
+    s = md_core.lstrip()
+    if s.startswith("{"):
+        first_nl = s.find("\n")
+        s = s[first_nl + 1:] if first_nl != -1 else ""
+        as_of = datetime.utcnow().date().isoformat()
+        header = f"# {ticker.upper()} — Equity Research Note\n_As of {as_of}_\n\n"
+        return header + s
+    return md_core
 
 # ---------- Report builder ----------
 def _build_report_markdown(ticker: str) -> str:
     """Build report markdown or raise HTTPException with useful details."""
-    # 1) Build core model
     try:
         model = build_model(ticker, force_refresh=False)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Model error: {type(e).__name__}: {e}")
 
-    # 2) If service returned an error envelope, surface it
     if isinstance(model, dict) and "error" in model:
         logger.error("Model error for %s: %r", ticker, model["error"])
         err = model["error"]
@@ -234,14 +246,12 @@ def _build_report_markdown(ticker: str) -> str:
             err = repr(err)
         raise HTTPException(status_code=400, detail=f"Model error: {err}")
 
-    # 3) Optional aux data (safe-fail)
     try:
         try:
             macro = macro_snapshot()
         except Exception:
             macro = {}
 
-        # Price series for momentum
         try:
             hist = fmp.historical_prices(ticker, limit=300) or []
         except Exception:
@@ -249,20 +259,17 @@ def _build_report_markdown(ticker: str) -> str:
 
         closes: List[float] = []
         if hist:
-            # ensure oldest -> newest for SMA math
             hist_sorted = sorted(
                 [h for h in hist if isinstance(h, dict) and h.get("close") is not None and h.get("date")],
                 key=lambda r: r["date"]
             )
             closes = [float(h["close"]) for h in hist_sorted]
 
-        # built-in momentum calc (if present)
         try:
             q_mom = signal_momentum(hist) if hist else {}
         except Exception:
             q_mom = {}
 
-        # Our own SMA/RSI for display
         sma20 = _sma(closes, 20)
         sma50 = _sma(closes, 50)
         sma200 = _sma(closes, 200)
@@ -275,11 +282,10 @@ def _build_report_markdown(ticker: str) -> str:
                 trend_note = "Price is above 200D and 50D>200D (uptrend bias)."
             elif last_px < sma200 and sma50 and sma50 < sma200:
                 trend_note = "Price is below 200D and 50D<200D (downtrend bias)."
-
         price_note = f"Last price: {_fmt_money(last_px, BASE_CURRENCY, 2)}." if last_px else None
 
-        # 4) Compose your original report (keep existing behavior)
-        md_core = compose_report({
+        # Compose baseline (preserve your existing output)
+        md_core_raw = compose_report({
             "symbol": ticker.upper(),
             "as_of": "latest",
             "call": "Review",
@@ -290,23 +296,21 @@ def _build_report_markdown(ticker: str) -> str:
             "fundamentals": model.get("core_financials", {}),
             "dcf": model.get("dcf_valuation", {}),
             "valuation": {"wacc": None},
-            # pass some extra context; composer will ignore unknown keys harmlessly
             "quant": {
                 "last_price": last_px,
                 "sma20": sma20, "sma50": sma50, "sma200": sma200,
                 "rsi14": rsi14, "momentum": q_mom
             },
-            "comps": {"peers": []},  # we also append our own table below
+            "comps": {"peers": []},
             "citations": [],
             "quarter": {},
             "artifact_id": "ui-session",
         })
+        md_core = _clean_composer_markdown(md_core_raw, ticker)
 
-        # 5) Add our Executive Summary + Momentum + Peer comps as appendices
+        # Executive Summary
         fundamentals = model.get("core_financials", {}) or model.get("fundamentals", {}) or {}
         dcf          = model.get("dcf_valuation", {})  or model.get("dcf", {})          or {}
-
-        # Executive Summary (prefer LLM if available)
         summary_prompt = f"""
 Write a concise (4–6 bullets) executive summary for {ticker.upper()} using these metrics:
 
@@ -316,10 +320,13 @@ ROE={fundamentals.get('ratios', {}).get('roe')}, ROA={fundamentals.get('ratios',
 DCF EV={dcf.get('enterprise_value')}, Equity={dcf.get('equity_value')}, Per-share={dcf.get('fair_value_per_share')}, Terminal%={dcf.get('terminal_value_pct')}
 Recent price: {last_px}, SMA20={sma20}, SMA50={sma50}, SMA200={sma200}, RSI14={rsi14}
 
-Tone: neutral, factual, non-promotional. Interpret; do not just restate numbers.
+Tone: neutral, factual, non-promotional. Interpret; avoid absolute buy/sell language.
 """
         ai_note = _llm_commentary(summary_prompt)
-        summary = ai_note or _rule_based_summary(fundamentals, dcf, price_note, trend_note)
+        if ai_note:
+            summary = _bulletize(ai_note)
+        else:
+            summary = _rule_based_summary(fundamentals, dcf, price_note, trend_note)
 
         # Momentum table
         momentum_rows = [
@@ -332,7 +339,7 @@ Tone: neutral, factual, non-promotional. Interpret; do not just restate numbers.
         if trend_note:
             momentum_rows.append(["Trend Note", trend_note])
 
-        # Peer comps (best-effort)
+        # Peer comps
         peer_syms = _fetch_peers(ticker)
         peer_rows = _build_peer_rows(peer_syms) if peer_syms else []
         comps_md = ""
@@ -343,7 +350,7 @@ Tone: neutral, factual, non-promotional. Interpret; do not just restate numbers.
                 ""
             ])
 
-        # Assemble appended markdown
+        # Append our sections after composer
         as_of = datetime.utcnow().date().isoformat()
         extras = []
         extras.append(f"\n---\n\n## Executive Summary (as of {as_of})\n")
