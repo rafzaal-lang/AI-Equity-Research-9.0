@@ -5,8 +5,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from datetime import datetime, date
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Request, Query, Body
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
@@ -30,11 +31,19 @@ except Exception:
 
 app = FastAPI(title="Reports Service")
 
+# Permissive CORS (UI compatibility)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten if you have a fixed UI origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class ReportResponse(BaseModel):
     symbol: str
     markdown: str
 
-# Accept both { "ticker": "AAPL" } and { "symbol": "AAPL" }
 class ReportRequest(BaseModel):
     ticker: Optional[str] = Field(default=None)
     symbol: Optional[str] = Field(default=None)
@@ -49,12 +58,12 @@ class ReportRequest(BaseModel):
 def root():
     return {
         "service": "AI Equity Research - Reports Service",
-        "version": "9.0",
+        "version": "9.1",
         "status": "healthy",
         "endpoints": {
             "health": "/v1/health",
-            "report": "/v1/report/{ticker}",
-            "report_post": "/report  (POST)",
+            "report_get": "/v1/report/{ticker}",
+            "report_post": "/report (POST), /v1/report (POST), /report (GET)",
             "ai_analysis": "/v1/ai-analysis/{ticker}",
             "metrics": "/metrics",
             "docs": "/docs"
@@ -71,7 +80,7 @@ def health():
 
 @app.get("/favicon.ico")
 def favicon():
-    return Response(status_code=204)  # No content
+    return Response(status_code=204)
 
 # --------------------------------------------------------------------------------------
 # METRICS
@@ -182,17 +191,16 @@ def get_ai_analysis(ticker: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------------------------------------------------------------------
-# FULL REPORT (GET & POST)
+# REPORT BUILDING
 # --------------------------------------------------------------------------------------
 def _build_report_markdown(ticker: str) -> str:
-    # Core data
     model = build_model(ticker)
     if "error" in model:
         raise HTTPException(status_code=404, detail=model["error"])
 
     macro = macro_snapshot()
 
-    # Prices for quant signals (guard if provider lacks the function)
+    # Prices for quant signals
     try:
         hist = fmp.historical_prices(ticker, limit=300) or []
     except Exception:
@@ -211,7 +219,6 @@ def _build_report_markdown(ticker: str) -> str:
     except Exception:
         q_sma = {}
 
-    # Compose markdown (new signature compose(symbol, as_of, data=...))
     md = compose(
         ticker.upper(),
         as_of=(macro or {}).get("as_of") or date.today().isoformat(),
@@ -220,11 +227,14 @@ def _build_report_markdown(ticker: str) -> str:
             "conviction": 6.5,
             "target_low": "—",
             "target_high": "—",
-            "momentum": q_mom,
+            "momentum": q_mom,  # composer expects 'momentum' at top-level
             "fundamentals": model.get("core_financials", {}),
             "dcf": model.get("dcf_valuation", {}),
             "valuation": model.get("valuation", {}),
-            "comps": {"peers": (model.get("comps") or {}).get("peers") or (comps_table(ticker) or {}).get("peers", [])},
+            "comps": {
+                "peers": (model.get("comps") or {}).get("peers")
+                         or (comps_table(ticker) or {}).get("peers", [])
+            },
             "quarter": model.get("quarter", {}),
             "citations": model.get("citations", []),
             "risks": model.get("risks", []),
@@ -232,8 +242,11 @@ def _build_report_markdown(ticker: str) -> str:
     )
     return md
 
+# --------------------------------------------------------------------------------------
+# FULL REPORT (GET & POST) – VERY FORGIVING INPUTS
+# --------------------------------------------------------------------------------------
 @app.get("/v1/report/{ticker}", response_model=ReportResponse)
-def get_report(ticker: str):
+def get_report_v1(ticker: str):
     try:
         md = _build_report_markdown(ticker)
         return ReportResponse(symbol=ticker.upper(), markdown=md)
@@ -242,16 +255,84 @@ def get_report(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# UI compatibility: allow POST /report and POST /v1/report with body
-@app.post("/report", response_model=ReportResponse)
-@app.post("/v1/report", response_model=ReportResponse)
-def post_report(req: ReportRequest):
-    symbol = req.get_symbol()
-    if not symbol:
+# GET /report?ticker=AAPL (compat for some UIs)
+@app.get("/report", response_model=ReportResponse)
+def get_report_compat(ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
+    sym = (ticker or symbol or "").strip()
+    if not sym:
         raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
     try:
-        md = _build_report_markdown(symbol)
-        return ReportResponse(symbol=symbol.upper(), markdown=md)
+        md = _build_report_markdown(sym)
+        return ReportResponse(symbol=sym.upper(), markdown=md)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# POST /v1/report with JSON body (kept for API users)
+@app.post("/v1/report", response_model=ReportResponse)
+def post_report_v1(req: ReportRequest):
+    sym = req.get_symbol()
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
+    try:
+        md = _build_report_markdown(sym)
+        return ReportResponse(symbol=sym.upper(), markdown=md)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# POST /report – accepts JSON, form-data, querystring, or raw text bodies
+@app.post("/report", response_model=ReportResponse)
+async def post_report_compat(
+    request: Request,
+    ticker_body: Optional[str] = Body(default=None),
+    symbol_body: Optional[str] = Body(default=None),
+    ticker_q: Optional[str] = Query(default=None),
+    symbol_q: Optional[str] = Query(default=None),
+):
+    # 1) direct body fields from Body(...)
+    sym = (ticker_body or symbol_body or "").strip()
+
+    # 2) JSON body (generic)
+    if not sym:
+        try:
+            data = await request.json()
+            if isinstance(data, dict):
+                sym = (data.get("ticker") or data.get("symbol") or data.get("t") or "").strip()
+            elif isinstance(data, str):
+                sym = data.strip()
+        except Exception:
+            pass
+
+    # 3) form-data
+    if not sym:
+        try:
+            form = await request.form()
+            sym = (form.get("ticker") or form.get("symbol") or "").strip()
+        except Exception:
+            pass
+
+    # 4) querystring fallback
+    if not sym:
+        sym = (ticker_q or symbol_q or "").strip()
+
+    # 5) raw text body fallback
+    if not sym:
+        try:
+            raw = (await request.body()).decode(errors="ignore").strip()
+            if raw and len(raw) < 32:
+                sym = raw
+        except Exception:
+            pass
+
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
+
+    try:
+        md = _build_report_markdown(sym)
+        return ReportResponse(symbol=sym.upper(), markdown=md)
     except HTTPException:
         raise
     except Exception as e:
