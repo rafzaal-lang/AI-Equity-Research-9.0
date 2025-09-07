@@ -47,17 +47,16 @@ class DataValidationResult:
     metadata: Dict[str, Any]
 
 @dataclass
-class APICallMetrics:
-    """Metrics for API calls."""
-    endpoint: str
-    symbol: str
-    start_time: float
-    end_time: float
-    success: bool
-    cached: bool
-    error_message: Optional[str] = None
-    response_size: Optional[int] = None
-    rate_limited: bool = False
+def __init__(self):
+    self.api_key = FMP_API_KEY
+    self.base_url = FMP_BASE_URL
+    self.session = SESSION
+    self.call_metrics: List[APICallMetrics] = []
+    self.max_metrics_history = 1000  # ADD THIS LINE
+    self.rate_limiter = self._init_rate_limiter()
+    
+    if not self.api_key:
+        raise FMPError("FMP_API_KEY environment variable is required")
 
 class FMPError(Exception):
     """Custom FMP API error."""
@@ -80,6 +79,13 @@ class EnhancedFMPProvider:
         self.session = SESSION
         self.call_metrics: List[APICallMetrics] = []
         self.rate_limiter = self._init_rate_limiter()
+
+def _cleanup_old_metrics(self):
+    """Remove old metrics to prevent memory leaks."""
+    if len(self.call_metrics) > self.max_metrics_history:
+        # Keep only the most recent metrics
+        self.call_metrics = self.call_metrics[-self.max_metrics_history:]
+
         
         if not self.api_key:
             raise FMPError("FMP_API_KEY environment variable is required")
@@ -166,6 +172,9 @@ class EnhancedFMPProvider:
                 data = response.json()
             except ValueError as e:
                 raise FMPError(f"Invalid JSON response: {e}")
+
+self.call_metrics.append(metrics)
+self._cleanup_old_metrics()  # ADD THIS LINE
             
             # Check for API-level errors
             if isinstance(data, dict) and "Error Message" in data:
@@ -182,7 +191,10 @@ class EnhancedFMPProvider:
             metrics.error_message = "Request timeout"
             self.call_metrics.append(metrics)
             raise FMPError("Request timeout")
-            
+
+self.call_metrics.append(metrics)
+self._cleanup_old_metrics()  # ADD THIS LINE
+
         except requests.exceptions.ConnectionError:
             metrics.end_time = time.time()
             metrics.error_message = "Connection error"
@@ -476,4 +488,5 @@ class EnhancedFMPProvider:
 
 # Global instance
 enhanced_fmp_provider = EnhancedFMPProvider()
+
 
