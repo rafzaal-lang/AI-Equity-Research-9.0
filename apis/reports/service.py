@@ -31,7 +31,7 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
-VERSION = "9.4"
+VERSION = "9.5"
 
 app = FastAPI(title="Reports Service")
 
@@ -133,7 +133,9 @@ def test_individual_apis(ticker: str):
         results["openai"] = f"FAILED: {e}"
     try:
         model = build_model(ticker)
-        results["financial_model"] = "SUCCESS" if model and "error" not in model else "NO_DATA"
+        # New: only treat as error if the value is meaningful/truthy
+        err = model.get("error") if isinstance(model, dict) else None
+        results["financial_model"] = "SUCCESS" if not err else f"ERROR_VALUE:{err!r}"
     except Exception as e:
         results["financial_model"] = f"FAILED: {e}"
     try:
@@ -154,7 +156,6 @@ async def _extract_symbol_from_request(request: Request) -> str:
     Prints a short line for visibility even if logging isn't configured.
     """
     ctype = request.headers.get("content-type", "")
-    # Read body (FastAPI caches it; safe to read multiple times)
     try:
         raw_body = (await request.body()) or b""
     except Exception:
@@ -227,28 +228,39 @@ async def _extract_symbol_from_request(request: Request) -> str:
 # --------------------------------------------------------------------------------------
 def _build_report_markdown(ticker: str) -> str:
     model = build_model(ticker)
-    if "error" in model:
-        raise HTTPException(status_code=404, detail=model["error"])
+
+    # NEW: only raise if error value is meaningful (not 0/""/None/False)
+    if isinstance(model, dict):
+        err = model.get("error", None)
+        if err not in (None, "", 0, False):
+            raise HTTPException(status_code=404, detail=str(err))
+    else:
+        # Keep going if model isn't a dict; downstream calls will handle missing keys
+        print(f"[reports] build_model returned non-dict for {ticker}: {type(model).__name__}")
 
     macro = macro_snapshot()
 
     # Prices for quant signals
     try:
         hist = fmp.historical_prices(ticker, limit=300) or []
-    except Exception:
+    except Exception as e:
+        print(f"[reports] historical_prices failed for {ticker}: {e}")
         hist = []
 
     try:
         q_mom = momentum(hist) if hist else {}
-    except Exception:
+    except Exception as e:
+        print(f"[reports] momentum failed for {ticker}: {e}")
         q_mom = {}
     try:
         q_rsi = rsi(hist) if hist else {}
-    except Exception:
+    except Exception as e:
+        print(f"[reports] rsi failed for {ticker}: {e}")
         q_rsi = {}
     try:
         q_sma = sma_cross(hist) if hist else {}
-    except Exception:
+    except Exception as e:
+        print(f"[reports] sma_cross failed for {ticker}: {e}")
         q_sma = {}
 
     md = compose(
@@ -260,16 +272,16 @@ def _build_report_markdown(ticker: str) -> str:
             "target_low": "—",
             "target_high": "—",
             "momentum": q_mom,  # composer expects 'momentum' at top-level
-            "fundamentals": model.get("core_financials", {}),
-            "dcf": model.get("dcf_valuation", {}),
-            "valuation": model.get("valuation", {}),
+            "fundamentals": (model or {}).get("core_financials", {}) if isinstance(model, dict) else {},
+            "dcf":          (model or {}).get("dcf_valuation", {}) if isinstance(model, dict) else {},
+            "valuation":    (model or {}).get("valuation", {})      if isinstance(model, dict) else {},
             "comps": {
-                "peers": (model.get("comps") or {}).get("peers")
+                "peers": ((model or {}).get("comps", {}) if isinstance(model, dict) else {}).get("peers")
                          or (comps_table(ticker) or {}).get("peers", [])
             },
-            "quarter": model.get("quarter", {}),
-            "citations": model.get("citations", []),
-            "risks": model.get("risks", []),
+            "quarter": (model or {}).get("quarter", {}) if isinstance(model, dict) else {},
+            "citations": (model or {}).get("citations", []) if isinstance(model, dict) else [],
+            "risks": (model or {}).get("risks", []) if isinstance(model, dict) else [],
         },
     )
     return md
@@ -285,12 +297,16 @@ def get_ai_analysis(ticker: str):
         raise HTTPException(status_code=500, detail="AI analyst not available")
     try:
         model = build_model(ticker)
-        if "error" in model:
-            raise HTTPException(status_code=404, detail=model["error"])
+        # NEW: handle {"error": 0} safely
+        if isinstance(model, dict):
+            err = model.get("error", None)
+            if err not in (None, "", 0, False):
+                raise HTTPException(status_code=404, detail=str(err))
+
         comp = comps_table(ticker)
         financial_data = {
-            "fundamentals": model.get("core_financials", {}),
-            "dcf_valuation": model.get("dcf_valuation", {}),
+            "fundamentals": (model or {}).get("core_financials", {}) if isinstance(model, dict) else {},
+            "dcf_valuation": (model or {}).get("dcf_valuation", {}) if isinstance(model, dict) else {},
             "comps": comp,
         }
         analysis = ai_financial_analyst.analyze_company(ticker, financial_data)
