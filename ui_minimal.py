@@ -32,7 +32,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # Imports
 try:
     from src.services.financial_modeler import build_model
-    from reports.composer import compose as compose_report
+    from src.services.report.composer import compose as compose_report
     from src.services.macro.snapshot import macro_snapshot
     from src.services.quant.signals import momentum as signal_momentum
     try:
@@ -472,3 +472,4 @@ def debug_env():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8090")))
+
