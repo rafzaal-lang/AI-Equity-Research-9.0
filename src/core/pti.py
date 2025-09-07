@@ -30,9 +30,16 @@ def calculate_cagr(rows: List[Dict], value_key: str, date_key: str = "date", yea
         return None
     
     sorted_rows = sorted([r for r in rows if r.get(date_key) and r.get(value_key) is not None], 
+ # REPLACE lines 33-43 with:
+def calculate_cagr(rows: List[Dict], value_key: str, date_key: str = "date", years: int = 3) -> Optional[float]:
+    """Calculate compound annual growth rate from time series data."""
+    if len(rows) < 2:
+        return None
+    
+    sorted_rows = sorted([r for r in rows if r.get(date_key) and r.get(value_key) is not None], 
                         key=lambda x: x[date_key])
     
-    if len(sorted_rows) < years:
+    if len(sorted_rows) < 2:
         return None
         
     first_val = sorted_rows[0][value_key]
@@ -40,7 +47,20 @@ def calculate_cagr(rows: List[Dict], value_key: str, date_key: str = "date", yea
     
     if first_val is None or last_val is None or first_val <= 0:
         return None
+    
+    # FIX: Calculate actual years between dates
+    from datetime import datetime
+    try:
+        start_date = datetime.strptime(sorted_rows[0][date_key], "%Y-%m-%d")
+        end_date = datetime.strptime(sorted_rows[-1][date_key], "%Y-%m-%d")
+        actual_years = (end_date - start_date).days / 365.25
         
+        if actual_years <= 0:
+            return None
+            
+        return (last_val / first_val) ** (1 / actual_years) - 1
+    except (ValueError, TypeError):
+        return None       
     n_years = len(sorted_rows) - 1
     return (last_val / first_val) ** (1 / n_years) - 1
 
@@ -163,4 +183,5 @@ def create_pti_snapshot(symbol: str, as_of: str, data_sources: Dict[str, List[Di
             snapshot["financials"][source_name] = latest
     
     return snapshot
+
 
