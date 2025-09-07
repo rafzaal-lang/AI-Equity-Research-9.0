@@ -1,203 +1,186 @@
-# src/services/providers/fmp_provider.py
 """
-Financial Modeling Prep (FMP) provider helpers.
+Financial Modeling Prep (FMP) provider — drop-in module.
 
-Env:
-  FMP_API_KEY=...   (required)
+This module wraps commonly used FMP endpoints and normalizes responses so
+callers can safely access dictionaries (e.g., .get(...)) without hitting
+"list has no attribute 'get'" errors.
+
+Environment:
+    FMP_API_KEY: required
+
+Public functions:
+    latest_price(ticker) -> float | None
+    price(ticker) -> float | None                # alias
+    quote(ticker) -> dict | None
+    profile(ticker) -> dict | None
+    enterprise_values(ticker) -> dict | None
+    get_enterprise_values(ticker) -> dict | None # alias
+    market_cap(ticker) -> float | None
+    key_metrics(ticker) -> dict | None
+    financials_annual(ticker) -> dict[str, list[dict]]  # income/balance/cashflow
+    ev_and_marketcap(ticker) -> dict[str, float | None]
 """
+from __future__ import annotations
 
 import os
+import logging
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-# ------------------------- Core HTTP helpers -------------------------------
+import requests
 
-BASE_FMP = "https://financialmodelingprep.com/api/v3"
-FMP_KEY = os.getenv("FMP_API_KEY")
+log = logging.getLogger(__name__)
 
-
-def _require_key() -> None:
-    if not FMP_KEY:
-        raise RuntimeError("FMP_API_KEY not set")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
+BASE_URL = "https://financialmodelingprep.com/api/v3"
 
 
-def _get(path: str, **params) -> Any:
+class FMPError(RuntimeError):
+    pass
+
+
+def _require_key():
+    if not FMP_API_KEY:
+        raise FMPError("FMP_API_KEY is not set in environment.")
+
+
+def _url(path: str) -> str:
+    return f"{BASE_URL}{path}?apikey={FMP_API_KEY}"
+
+
+def _get(path: str) -> Any:
+    """GET helper that returns parsed JSON or None.
+
+    FMP typically returns a list; we don't coerce here except in public fns.
     """
-    Synchronous GET to FMP. Returns parsed JSON (dict or list).
-      _get("profile/AAPL")
-      _get("historical-price-full/AAPL", serietype="line", **{"from":"2023-01-01","to":"2024-12-31"})
-    """
-    import requests
-
     _require_key()
-    params = dict(params or {})
-    params["apikey"] = FMP_KEY
-    url = f"{BASE_FMP}/{path}"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-async def _aget(path: str, **params) -> Any:
-    """
-    Async GET to FMP (httpx). Use this only from async code.
-    """
-    import httpx
-
-    _require_key()
-    params = dict(params or {})
-    params["apikey"] = FMP_KEY
-    url = f"{BASE_FMP}/{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
-
-
-# ------------------------- Convenience wrappers ---------------------------
-
-def historical_prices(
-    symbol: str,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    limit: Optional[int] = None,
-    serietype: str = "line",
-) -> List[Dict[str, Any]]:
-    """
-    Returns a list of {date, close} sorted ascending by date.
-    """
-    params: Dict[str, Any] = {"serietype": serietype}
-    if start:
-        params["from"] = start
-    if end:
-        params["to"] = end
-    if limit:
-        # FMP accepts 'timeseries' as a count (last N points)
-        params["timeseries"] = limit
-
-    data = _get(f"historical-price-full/{symbol}", **params) or {}
-    hist = data.get("historical") or []
-    rows = [{"date": h.get("date"), "close": h.get("close")} for h in hist if h.get("close") is not None]
-    rows.sort(key=lambda r: r.get("date") or "")
-    return rows
-
-
-def profile(symbol: str) -> Dict[str, Any]:
-    """
-    Company profile. Returns {} if missing.
-    """
-    arr = _get(f"profile/{symbol}") or []
-    return (arr or [{}])[0]
-
-
-def earnings_surprises(symbol: str) -> List[Dict[str, Any]]:
-    return _get(f"earnings-surprises/{symbol}") or []
-
-
-def transcripts(symbol: str) -> List[Dict[str, Any]]:
-    # Each item typically has {date, content, ...}
-    return _get(f"earning_call_transcript/{symbol}") or []
-
-
-def key_metrics(symbol: str, period: str = "annual", limit: int = 40) -> List[Dict[str, Any]]:
-    return _get(f"key-metrics/{symbol}", period=period, limit=limit) or []
-
-
-def key_metrics_ttm(symbol: str) -> List[Dict[str, Any]]:
-    data = _get(f"key-metrics-ttm/{symbol}") or []
-    return data if isinstance(data, list) else [data]
-
-
-def financial_ratios(symbol: str, period: str = "annual", limit: int = 40) -> List[Dict[str, Any]]:
-    return _get(f"ratios/{symbol}", period=period, limit=limit) or []
-
-
-def enterprise_values(symbol: str, period: str = "annual", limit: int = 40) -> List[Dict[str, Any]]:
-    data = _get(f"enterprise-values/{symbol}", period=period, limit=limit) or {}
-    return data.get("enterpriseValues") or []
-
-
-def income_statement(symbol: str, period: str = "annual", limit: int = 40) -> List[Dict[str, Any]]:
-    return _get(f"income-statement/{symbol}", period=period, limit=limit) or []
-
-
-def balance_sheet(symbol: str, period: str = "annual", limit: int = 40) -> List[Dict[str, Any]]:
-    return _get(f"balance-sheet-statement/{symbol}", period=period, limit=limit) or []
-
-
-def cash_flow(symbol: str, period: str = "annual", limit: int = 40) -> List[Dict[str, Any]]:
-    return _get(f"cash-flow-statement/{symbol}", period=period, limit=limit) or []
-
-
-def screener_by_industry(industry: str, exchange: str = "NASDAQ,NYSE", limit: int = 200) -> List[str]:
-    """
-    Returns list of peer symbols for a given industry.
-    """
-    arr = _get("stock-screener", industry=industry, exchange=exchange, limit=limit) or []
-    return [x.get("symbol") for x in arr if x.get("symbol")]
-
-# --- Peer universe helper (robust signature) --------------------------------
-from typing import Optional
-
-def peers_by_screener(symbol: str, *args, **kwargs) -> list[str]:
-    """
-    Build a peer list using FMP's stock-screener by industry.
-    Flexible signature to match various older call sites:
-
-        peers_by_screener("AAPL")                          -> default industry via profile, ~25 names
-        peers_by_screener("AAPL", 30)                      -> ~30 names
-        peers_by_screener("AAPL", "Consumer Electronics")  -> override industry
-        peers_by_screener("AAPL", "Consumer Electronics", 50)
-        peers_by_screener("AAPL", max_peers=40, exchange="NASDAQ,NYSE")
-
-    Returns a list of tickers (uppercase), excluding the input symbol, de-duped.
-    """
-    # Defaults
-    max_peers: int = kwargs.get("max_peers", kwargs.get("size", 25))
-    exchange: str = kwargs.get("exchange", "NASDAQ,NYSE")
-    industry: Optional[str] = kwargs.get("industry")
-
-    # Positional arg parsing for backward compatibility
-    if args:
-        # 1st arg could be industry (str) OR max_peers (int)
-        if isinstance(args[0], str) and not industry:
-            industry = args[0]
-        elif isinstance(args[0], int):
-            max_peers = args[0]
-        # 2nd arg could be max_peers (int) OR exchange (str)
-        if len(args) > 1:
-            if isinstance(args[1], int):
-                max_peers = args[1]
-            elif isinstance(args[1], str):
-                exchange = args[1]
-
-    sym = (symbol or "").upper().strip()
-
-    # Determine industry if not provided
-    if not industry:
-        try:
-            prof = profile(sym)  # uses FMP /profile/{symbol}
-        except Exception:
-            prof = {}
-        industry = (prof.get("industry") or prof.get("sector") or "").strip()
-
-    if not industry:
-        # No way to screen peers without an industry
-        return []
-
-    # Pull candidates via stock screener
+    url = _url(path)
     try:
-        candidates = screener_by_industry(industry=industry, exchange=exchange, limit=200)
-    except Exception:
-        candidates = []
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.warning("FMP GET failed for %s: %s", path, e)
+        return None
 
-    # De-dup, uppercase, remove self, cap to max_peers
-    out: list[str] = []
-    for t in candidates or []:
-        u = (t or "").upper().strip()
-        if not u or u == sym:
-            continue
-        if u not in out:
-            out.append(u)
-        if len(out) >= max_peers:
-            break
-    return out
+
+def _head_or_none(obj: Any) -> Optional[Dict[str, Any]]:
+    """Normalize FMP list responses to the first dict element, else None."""
+    if obj is None:
+        return None
+    if isinstance(obj, list):
+        return obj[0] if obj else None
+    if isinstance(obj, dict):
+        return obj
+    # Unexpected type; return None to keep callers safe
+    return None
+
+
+# --------------------------- Public API ---------------------------
+
+@lru_cache(maxsize=1024)
+def quote(ticker: str) -> Optional[Dict[str, Any]]:
+    """Full quote with marketCap, price, volume, etc."""
+    data = _get(f"/quote/{ticker.upper()}")
+    return _head_or_none(data)
+
+
+@lru_cache(maxsize=4096)
+def latest_price(ticker: str) -> Optional[float]:
+    """Lightweight latest price; falls back to full quote if needed."""
+    data = _get(f"/quote-short/{ticker.upper()}")
+    head = _head_or_none(data)
+    if head and isinstance(head, dict) and "price" in head:
+        try:
+            return float(head["price"])
+        except Exception:
+            pass
+    # Fallback to full quote
+    q = quote(ticker)
+    if q and isinstance(q, dict):
+        p = q.get("price") or q.get("previousClose")
+        try:
+            return float(p) if p is not None else None
+        except Exception:
+            return None
+    return None
+
+
+# Alias commonly used by callers
+price = latest_price
+
+
+@lru_cache(maxsize=1024)
+def profile(ticker: str) -> Optional[Dict[str, Any]]:
+    return _head_or_none(_get(f"/profile/{ticker.upper()}"))
+
+
+@lru_cache(maxsize=2048)
+def enterprise_values(ticker: str) -> Optional[Dict[str, Any]]:
+    """Return the most recent enterprise value row as a dict.
+
+    Many FMP endpoints return a list sorted from most recent to oldest.
+    We always normalize to the first item, so callers can safely do .get(...).
+    """
+    return _head_or_none(_get(f"/enterprise-values/{ticker.upper()}"))
+
+
+# Backward compatible alias
+get_enterprise_values = enterprise_values
+
+
+@lru_cache(maxsize=1024)
+def market_cap(ticker: str) -> Optional[float]:
+    q = quote(ticker)
+    if q and isinstance(q, dict):
+        mc = q.get("marketCap")
+        try:
+            return float(mc) if mc is not None else None
+        except Exception:
+            return None
+    # Fallback: some profiles include mktCap
+    p = profile(ticker)
+    if p and isinstance(p, dict):
+        mc = p.get("mktCap") or p.get("marketCap")
+        try:
+            return float(mc) if mc is not None else None
+        except Exception:
+            return None
+    return None
+
+
+@lru_cache(maxsize=1024)
+def key_metrics(ticker: str) -> Optional[Dict[str, Any]]:
+    return _head_or_none(_get(f"/key-metrics/{ticker.upper()}"))
+
+
+@lru_cache(maxsize=256)
+def financials_annual(ticker: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Return standardized annual financial statements.
+
+    Each list is newest-first, as returned by FMP.
+    """
+    income = _get(f"/income-statement/{ticker.upper()}") or []
+    balance = _get(f"/balance-sheet-statement/{ticker.upper()}") or []
+    cash = _get(f"/cash-flow-statement/{ticker.upper()}") or []
+    # Ensure lists
+    income = income if isinstance(income, list) else []
+    balance = balance if isinstance(balance, list) else []
+    cash = cash if isinstance(cash, list) else []
+    return {
+        "income_statement": income,
+        "balance_sheet": balance,
+        "cashflow_statement": cash,
+    }
+
+
+@lru_cache(maxsize=1024)
+def ev_and_marketcap(ticker: str) -> Dict[str, Optional[float]]:
+    ev_row = enterprise_values(ticker) or {}
+    ev = ev_row.get("enterpriseValue") if isinstance(ev_row, dict) else None
+    try:
+        ev_val = float(ev) if ev is not None else None
+    except Exception:
+        ev_val = None
+    mc_val = market_cap(ticker)
+    return {"enterpriseValue": ev_val, "marketCap": mc_val}
