@@ -8,7 +8,21 @@ from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import json
 try:
+   # replace: from src.services.report.composer import compose
+import json
+try:
     from src.services.report.composer import compose
+except Exception as _composer_err:
+    def compose(symbol: str, as_of: str, data=None, **kw):
+        parts = [
+            f"# {symbol} — Equity Research Note (as of {as_of})",
+            "",
+            "_(composer fallback used — original import failed)_",
+        ]
+        if data:
+            parts += ["", "```json", json.dumps(data, indent=2), "```"]
+        return "\n".join(parts)
+
 except Exception as _composer_err:
     def compose(symbol: str, as_of: str, data=None, **kw):
         parts = [
@@ -203,6 +217,7 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
+
 
 
 
