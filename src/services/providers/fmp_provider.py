@@ -134,3 +134,70 @@ def screener_by_industry(industry: str, exchange: str = "NASDAQ,NYSE", limit: in
     """
     arr = _get("stock-screener", industry=industry, exchange=exchange, limit=limit) or []
     return [x.get("symbol") for x in arr if x.get("symbol")]
+
+# --- Peer universe helper (robust signature) --------------------------------
+from typing import Optional
+
+def peers_by_screener(symbol: str, *args, **kwargs) -> list[str]:
+    """
+    Build a peer list using FMP's stock-screener by industry.
+    Flexible signature to match various older call sites:
+
+        peers_by_screener("AAPL")                          -> default industry via profile, ~25 names
+        peers_by_screener("AAPL", 30)                      -> ~30 names
+        peers_by_screener("AAPL", "Consumer Electronics")  -> override industry
+        peers_by_screener("AAPL", "Consumer Electronics", 50)
+        peers_by_screener("AAPL", max_peers=40, exchange="NASDAQ,NYSE")
+
+    Returns a list of tickers (uppercase), excluding the input symbol, de-duped.
+    """
+    # Defaults
+    max_peers: int = kwargs.get("max_peers", kwargs.get("size", 25))
+    exchange: str = kwargs.get("exchange", "NASDAQ,NYSE")
+    industry: Optional[str] = kwargs.get("industry")
+
+    # Positional arg parsing for backward compatibility
+    if args:
+        # 1st arg could be industry (str) OR max_peers (int)
+        if isinstance(args[0], str) and not industry:
+            industry = args[0]
+        elif isinstance(args[0], int):
+            max_peers = args[0]
+        # 2nd arg could be max_peers (int) OR exchange (str)
+        if len(args) > 1:
+            if isinstance(args[1], int):
+                max_peers = args[1]
+            elif isinstance(args[1], str):
+                exchange = args[1]
+
+    sym = (symbol or "").upper().strip()
+
+    # Determine industry if not provided
+    if not industry:
+        try:
+            prof = profile(sym)  # uses FMP /profile/{symbol}
+        except Exception:
+            prof = {}
+        industry = (prof.get("industry") or prof.get("sector") or "").strip()
+
+    if not industry:
+        # No way to screen peers without an industry
+        return []
+
+    # Pull candidates via stock screener
+    try:
+        candidates = screener_by_industry(industry=industry, exchange=exchange, limit=200)
+    except Exception:
+        candidates = []
+
+    # De-dup, uppercase, remove self, cap to max_peers
+    out: list[str] = []
+    for t in candidates or []:
+        u = (t or "").upper().strip()
+        if not u or u == sym:
+            continue
+        if u not in out:
+            out.append(u)
+        if len(out) >= max_peers:
+            break
+    return out
