@@ -1,5 +1,7 @@
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+from src.services.ai.financial_analyst import ai_financial_analyst
+from src.services.ai.risk_analyzer import ai_risk_analyzer
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
@@ -150,3 +152,4 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
+
