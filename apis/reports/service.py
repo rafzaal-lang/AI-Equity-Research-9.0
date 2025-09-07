@@ -3,11 +3,11 @@ import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 from datetime import datetime, date
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.services.report.composer import compose
@@ -24,7 +24,7 @@ except Exception:
     ai_financial_analyst = None  # type: ignore
 
 try:
-    from src.services.ai.risk_analyzer import ai_risk_analyzer  # optional
+    from src.services.ai.risk_analyzer import ai_risk_analyzer
 except Exception:
     ai_risk_analyzer = None  # type: ignore
 
@@ -34,6 +34,13 @@ class ReportResponse(BaseModel):
     symbol: str
     markdown: str
 
+# Accept both { "ticker": "AAPL" } and { "symbol": "AAPL" }
+class ReportRequest(BaseModel):
+    ticker: Optional[str] = Field(default=None)
+    symbol: Optional[str] = Field(default=None)
+
+    def get_symbol(self) -> str:
+        return (self.ticker or self.symbol or "").strip()
 
 # --------------------------------------------------------------------------------------
 # ROOT & HEALTH
@@ -47,6 +54,7 @@ def root():
         "endpoints": {
             "health": "/v1/health",
             "report": "/v1/report/{ticker}",
+            "report_post": "/report  (POST)",
             "ai_analysis": "/v1/ai-analysis/{ticker}",
             "metrics": "/metrics",
             "docs": "/docs"
@@ -65,14 +73,12 @@ def health():
 def favicon():
     return Response(status_code=204)  # No content
 
-
 # --------------------------------------------------------------------------------------
 # METRICS
 # --------------------------------------------------------------------------------------
 @app.get("/metrics")
 def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
 
 # --------------------------------------------------------------------------------------
 # DEBUG
@@ -93,7 +99,7 @@ def test_individual_apis(ticker: str):
 
     # FMP: historical prices
     try:
-        hist = fmp.historical_prices(ticker, limit=5)  # must exist in provider
+        hist = fmp.historical_prices(ticker, limit=5)
         results["fmp_historical"] = "SUCCESS" if hist else "NO_DATA"
     except Exception as e:
         results["fmp_historical"] = f"FAILED: {e}"
@@ -138,13 +144,11 @@ def test_individual_apis(ticker: str):
 
     return results
 
-
 # --------------------------------------------------------------------------------------
 # AI-ONLY ANALYSIS (JSON)
 # --------------------------------------------------------------------------------------
 @app.get("/v1/ai-analysis/{ticker}")
 def get_ai_analysis(ticker: str):
-    """Return pure AI analysis without building the full report."""
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=400, detail="OpenAI API key required")
     if ai_financial_analyst is None:
@@ -177,71 +181,81 @@ def get_ai_analysis(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --------------------------------------------------------------------------------------
+# FULL REPORT (GET & POST)
+# --------------------------------------------------------------------------------------
+def _build_report_markdown(ticker: str) -> str:
+    # Core data
+    model = build_model(ticker)
+    if "error" in model:
+        raise HTTPException(status_code=404, detail=model["error"])
 
-# --------------------------------------------------------------------------------------
-# FULL REPORT (MARKDOWN)
-# --------------------------------------------------------------------------------------
+    macro = macro_snapshot()
+
+    # Prices for quant signals (guard if provider lacks the function)
+    try:
+        hist = fmp.historical_prices(ticker, limit=300) or []
+    except Exception:
+        hist = []
+
+    try:
+        q_mom = momentum(hist) if hist else {}
+    except Exception:
+        q_mom = {}
+    try:
+        q_rsi = rsi(hist) if hist else {}
+    except Exception:
+        q_rsi = {}
+    try:
+        q_sma = sma_cross(hist) if hist else {}
+    except Exception:
+        q_sma = {}
+
+    # Compose markdown (new signature compose(symbol, as_of, data=...))
+    md = compose(
+        ticker.upper(),
+        as_of=(macro or {}).get("as_of") or date.today().isoformat(),
+        data={
+            "call": "Review",
+            "conviction": 6.5,
+            "target_low": "—",
+            "target_high": "—",
+            "momentum": q_mom,
+            "fundamentals": model.get("core_financials", {}),
+            "dcf": model.get("dcf_valuation", {}),
+            "valuation": model.get("valuation", {}),
+            "comps": {"peers": (model.get("comps") or {}).get("peers") or (comps_table(ticker) or {}).get("peers", [])},
+            "quarter": model.get("quarter", {}),
+            "citations": model.get("citations", []),
+            "risks": model.get("risks", []),
+        },
+    )
+    return md
+
 @app.get("/v1/report/{ticker}", response_model=ReportResponse)
 def get_report(ticker: str):
     try:
-        # Core data
-        model = build_model(ticker)
-        if "error" in model:
-            raise HTTPException(status_code=404, detail=model["error"])
-
-        macro = macro_snapshot()
-
-        # Prices for quant signals (guard if provider lacks the function)
-        try:
-            hist = fmp.historical_prices(ticker, limit=300) or []
-        except Exception:
-            hist = []
-
-        try:
-            q_mom = momentum(hist) if hist else {}
-        except Exception:
-            q_mom = {}
-        try:
-            q_rsi = rsi(hist) if hist else {}
-        except Exception:
-            q_rsi = {}
-        try:
-            q_sma = sma_cross(hist) if hist else {}
-        except Exception:
-            q_sma = {}
-
-        comp = comps_table(ticker)
-
-        # Compose markdown (NEW signature: compose(symbol, as_of, data=...))
-        md = compose(
-            ticker.upper(),
-            as_of=(macro or {}).get("as_of") or date.today().isoformat(),
-            data={
-                "call": "Review",
-                "conviction": 6.5,
-                "target_low": "—",
-                "target_high": "—",
-                # show momentum at top-level (composer expects this)
-                "momentum": q_mom,
-                # fundamentals / valuation / comps
-                "fundamentals": model.get("core_financials", {}),
-                "dcf": model.get("dcf_valuation", {}),
-                "valuation": model.get("valuation", {}),
-                "comps": {"peers": (comp or {}).get("peers", [])},
-                # optional extras if your model provides them
-                "quarter": model.get("quarter", {}),
-                "citations": model.get("citations", []),
-                "risks": model.get("risks", []),
-            },
-        )
-
+        md = _build_report_markdown(ticker)
         return ReportResponse(symbol=ticker.upper(), markdown=md)
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# UI compatibility: allow POST /report and POST /v1/report with body
+@app.post("/report", response_model=ReportResponse)
+@app.post("/v1/report", response_model=ReportResponse)
+def post_report(req: ReportRequest):
+    symbol = req.get_symbol()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="ticker (or symbol) is required")
+    try:
+        md = _build_report_markdown(symbol)
+        return ReportResponse(symbol=symbol.upper(), markdown=md)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------------------------------------------------------------------
 # DEV ENTRYPOINT
