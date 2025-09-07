@@ -5,10 +5,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from datetime import datetime, date
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Response, Request, Query, Body
+from fastapi import FastAPI, HTTPException, Response, Request, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.services.report.composer import compose
@@ -31,6 +31,8 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+VERSION = "9.4"
+
 app = FastAPI(title="Reports Service")
 
 # Permissive CORS for UI
@@ -46,12 +48,6 @@ class ReportResponse(BaseModel):
     symbol: str
     markdown: str
 
-class ReportRequest(BaseModel):
-    ticker: Optional[str] = Field(default=None)
-    symbol: Optional[str] = Field(default=None)
-    def get_symbol(self) -> str:
-        return (self.ticker or self.symbol or "").strip()
-
 # --------------------------------------------------------------------------------------
 # ROOT & HEALTH
 # --------------------------------------------------------------------------------------
@@ -59,7 +55,7 @@ class ReportRequest(BaseModel):
 def root():
     return {
         "service": "AI Equity Research - Reports Service",
-        "version": "9.3",
+        "version": VERSION,
         "status": "healthy",
         "endpoints": {
             "health": "/v1/health",
@@ -67,9 +63,13 @@ def root():
             "report_post": "/report (POST), /v1/report (POST), /report (GET), /report/{ticker} (POST), /report/ (POST)",
             "ai_analysis": "/v1/ai-analysis/{ticker}",
             "metrics": "/metrics",
-            "docs": "/docs"
-        }
+            "docs": "/docs",
+        },
     }
+
+@app.get("/version")
+def version():
+    return {"version": VERSION}
 
 @app.get("/health")
 def health_simple():
@@ -144,7 +144,7 @@ def test_individual_apis(ticker: str):
     return results
 
 # --------------------------------------------------------------------------------------
-# UTIL: extract & guess ticker from any kind of request
+# UTIL: extract & guess ticker from any kind of request (no Pydantic Body parsing)
 # --------------------------------------------------------------------------------------
 _TICKER_GUESS_RE = re.compile(r"[A-Za-z]{1,6}(\.[A-Za-z]{1,3})?")
 
@@ -154,83 +154,73 @@ async def _extract_symbol_from_request(request: Request) -> str:
     Prints a short line for visibility even if logging isn't configured.
     """
     ctype = request.headers.get("content-type", "")
+    # Read body (FastAPI caches it; safe to read multiple times)
     try:
         raw_body = (await request.body()) or b""
     except Exception:
         raw_body = b""
-    body_sample = raw_body[:256].decode(errors="ignore")
-    # Ensure visibility in Render logs:
-    print(f"[reports] POST /report dbg ctype={ctype} sample={body_sample!r}")
+    sample = raw_body[:256].decode(errors="ignore")
+    print(f"[reports] POST /report dbg ctype={ctype} sample={sample!r}")
 
-    sym = ""
-
-    # JSON
+    # 1) JSON
     try:
-        if "application/json" in ctype.lower():
-            data = json.loads(body_sample) if body_sample else await request.json()
+        if "application/json" in (ctype or "").lower():
+            try:
+                data = json.loads(raw_body.decode(errors="ignore"))
+            except Exception:
+                data = await request.json()  # second chance
             if isinstance(data, dict):
                 for k in ("ticker", "symbol", "t", "s", "security", "code"):
                     v = data.get(k)
                     if isinstance(v, str) and v.strip():
-                        sym = v.strip()
-                        break
-                if not sym:  # handle arrays/dicts
-                    for v in data.values():
-                        if isinstance(v, list) and v and isinstance(v[0], str):
-                            m = _TICKER_GUESS_RE.match(v[0].strip())
-                            if m:
-                                sym = v[0].strip()
-                                break
-                        if isinstance(v, dict):
-                            for vv in v.values():
-                                if isinstance(vv, str):
-                                    m = _TICKER_GUESS_RE.match(vv.strip())
-                                    if m:
-                                        sym = vv.strip()
-                                        break
-                            if sym:
-                                break
-            elif isinstance(data, str):
-                sym = data.strip()
+                        return v.strip().upper()
+                # arrays / nested dicts
+                for v in data.values():
+                    if isinstance(v, list) and v and isinstance(v[0], str):
+                        m = _TICKER_GUESS_RE.match(v[0].strip())
+                        if m:
+                            return v[0].strip().upper()
+                    if isinstance(v, dict):
+                        for vv in v.values():
+                            if isinstance(vv, str):
+                                m = _TICKER_GUESS_RE.match(vv.strip())
+                                if m:
+                                    return vv.strip().upper()
+            elif isinstance(data, str) and data.strip():
+                return data.strip().upper()
     except Exception:
         pass
 
-    # Form data
-    if not sym:
-        try:
-            form = await request.form()
-            for k in ("ticker", "symbol", "t", "s"):
-                v = form.get(k)
-                if isinstance(v, str) and v.strip():
-                    sym = v.strip(); break
-            if not sym:
-                for v in form.values():
-                    if isinstance(v, str):
-                        m = _TICKER_GUESS_RE.match(v.strip())
-                        if m:
-                            sym = v.strip(); break
-        except Exception:
-            pass
+    # 2) Form (x-www-form-urlencoded / multipart)
+    try:
+        form = await request.form()
+        for k in ("ticker", "symbol", "t", "s"):
+            v = form.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip().upper()
+        for v in form.values():
+            if isinstance(v, str):
+                m = _TICKER_GUESS_RE.match(v.strip())
+                if m:
+                    return v.strip().upper()
+    except Exception:
+        pass
 
-    # Query params
-    if not sym:
-        qp = request.query_params
-        for k in ("ticker", "symbol", "t", "s", "code"):
-            v = qp.get(k)
-            if v and v.strip():
-                sym = v.strip(); break
+    # 3) Query string
+    qp = request.query_params
+    for k in ("ticker", "symbol", "t", "s", "code"):
+        v = qp.get(k)
+        if v and v.strip():
+            return v.strip().upper()
 
-    # Raw text
-    if not sym and body_sample:
-        m = _TICKER_GUESS_RE.search(body_sample.strip())
+    # 4) Raw text fallback
+    if sample:
+        m = _TICKER_GUESS_RE.search(sample.strip())
         if m:
-            sym = m.group(0)
+            return m.group(0).upper()
 
-    sym = (sym or "").upper().strip()
-    if not sym:
-        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
-        print(f"[reports] no ticker found; defaulting to {sym}")
-    return sym
+    # FINAL FALLBACK
+    return os.getenv("DEFAULT_TICKER", "AAPL").upper()
 
 # --------------------------------------------------------------------------------------
 # REPORT BUILDING
@@ -317,7 +307,7 @@ def get_ai_analysis(ticker: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------------------------------------------------------------------
-# FULL REPORT (GET & POST) – VERY FORGIVING INPUTS
+# FULL REPORT (GET & POST) – ULTRA-FORGIVING
 # --------------------------------------------------------------------------------------
 @app.get("/v1/report/{ticker}", response_model=ReportResponse)
 def get_report_v1(ticker: str):
@@ -332,47 +322,58 @@ def get_report_v1(ticker: str):
 # GET /report?ticker=AAPL
 @app.get("/report", response_model=ReportResponse)
 def get_report_qs(ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
-    sym = (ticker or symbol or os.getenv("DEFAULT_TICKER", "AAPL")).strip()
+    sym = (ticker or symbol or os.getenv("DEFAULT_TICKER", "AAPL")).strip().upper()
     try:
         md = _build_report_markdown(sym)
-        return ReportResponse(symbol=sym.upper(), markdown=md)
+        return ReportResponse(symbol=sym, markdown=md)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /v1/report (JSON)
+# POST /v1/report (JSON: {"ticker":"AAPL"} or {"symbol":"AAPL"})
 @app.post("/v1/report", response_model=ReportResponse)
-def post_report_v1(req: ReportRequest):
-    sym = (req.get_symbol() or os.getenv("DEFAULT_TICKER", "AAPL")).strip()
+async def post_report_v1(request: Request):
+    # parse JSON leniently
+    sym = ""
+    try:
+        data = await request.json()
+        if isinstance(data, dict):
+            sym = (data.get("ticker") or data.get("symbol") or "").strip().upper()
+        elif isinstance(data, str):
+            sym = data.strip().upper()
+    except Exception:
+        sym = ""
+    if not sym:
+        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
     try:
         md = _build_report_markdown(sym)
-        return ReportResponse(symbol=sym.upper(), markdown=md)
+        return ReportResponse(symbol=sym, markdown=md)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# POST /report – accepts JSON, form-data, querystring, or raw text; defaults to env/AAPL
+# POST /report and /report/ – no Body() params at all; we read manually
 @app.post("/report", response_model=ReportResponse)
-@app.post("/report/", response_model=ReportResponse)  # handle trailing slash
-async def post_report_compat(
-    request: Request,
-    ticker_body: Optional[str] = Body(default=None),
-    symbol_body: Optional[str] = Body(default=None),
-    ticker_q: Optional[str] = Query(default=None),
-    symbol_q: Optional[str] = Query(default=None),
-):
-    sym = (ticker_body or symbol_body or "").strip()
+@app.post("/report/", response_model=ReportResponse)
+async def post_report_compat(request: Request, ticker: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None)):
+    # 1) Querystring wins if present
+    sym = (ticker or symbol or "").strip().upper()
+
+    # 2) Otherwise, try to extract from body (JSON, form, or raw text)
     if not sym:
         sym = await _extract_symbol_from_request(request)
-    if ticker_q or symbol_q:
-        sym = (ticker_q or symbol_q).strip()
+
+    # 3) Final fallback
+    if not sym:
+        sym = os.getenv("DEFAULT_TICKER", "AAPL").upper()
+
     try:
         md = _build_report_markdown(sym)
         return JSONResponse(
-            content=ReportResponse(symbol=sym.upper(), markdown=md).model_dump(),
-            headers={"X-Report-Symbol": sym.upper()}
+            content=ReportResponse(symbol=sym, markdown=md).model_dump(),
+            headers={"X-Report-Symbol": sym}
         )
     except HTTPException:
         raise
@@ -382,10 +383,10 @@ async def post_report_compat(
 # POST /report/{ticker}
 @app.post("/report/{ticker}", response_model=ReportResponse)
 async def post_report_with_path(ticker: str):
-    sym = (ticker or os.getenv("DEFAULT_TICKER", "AAPL")).strip()
+    sym = (ticker or os.getenv("DEFAULT_TICKER", "AAPL")).strip().upper()
     try:
         md = _build_report_markdown(sym)
-        return ReportResponse(symbol=sym.upper(), markdown=md)
+        return ReportResponse(symbol=sym, markdown=md)
     except HTTPException:
         raise
     except Exception as e:
